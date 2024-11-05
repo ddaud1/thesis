@@ -1,0 +1,11 @@
+[package]
+name = "wasmRuntime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.91"
+labeled = { git = "https://github.com/alevy/labeled", features = ["buckle"] }
+serde = "1.0.214"
+serde_json = "1.0.132"
+wasmtime = "26.0.0"
