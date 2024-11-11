@@ -1,6 +1,11 @@
+mod fs;
+mod blobstore;
+mod configs;
+
 use core::str;
 use std::env;
 use wasmtime::*;
+use fs::lmdb::get_dbenv;
 
 use anyhow::{Result, Error};
 use labeled::{buckle::{Buckle, Component}, Label};
@@ -32,7 +37,7 @@ fn main() -> Result<()>{
     };
 
     let mut store = Store::new(
-        &engine, 
+        &engine,
         init_state
     );
 
