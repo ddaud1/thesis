@@ -9,5 +9,5 @@ extism = "1.8.0"
 extism-convert = "1.8.0"
 labeled = { git = "https://github.com/alevy/labeled", features = ["buckle"] }
 faasten-core = { git = "https://github.com/ddaud1/faasten-core.git" }
-serde = "1.0.214"
+serde = {version = "1.0.102", features = ["derive"]}
 serde_json = "1.0.132"
