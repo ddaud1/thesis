@@ -5,23 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.91"
-crossbeam = "0.8.4"
 extism = "1.8.0"
 extism-convert = "1.8.0"
-hex = "0.4.3"
 labeled = { git = "https://github.com/alevy/labeled", features = ["buckle"] }
-lazy_static = "1.5.0"
-lmdb-rkv = "0.14.0"
-log = { version = "0.4.22", features = ["max_level_debug", "release_max_level_warn"]}
-prost = "0.13.3"
-rand = "0.8.5"
-regex = "1.11.1"
-rouille = "3.6.2"
+faasten-core = { git = "https://github.com/ddaud1/faasten-core.git" }
 serde = "1.0.214"
 serde_json = "1.0.132"
-serde_yaml = "0.9.34"
-sha2 = "0.10.8"
-tempfile = "3.14.0"
-tikv-client = "0.3.0"
-tokio = { version = "1", features = [ "rt", "macros",  "process", "net" ] }
-uuid = "1.11.0"
