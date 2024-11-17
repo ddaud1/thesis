@@ -3,7 +3,8 @@ use std::env;
 use std::collections::HashMap;
 use extism::*;
 use extism_convert::Json;
-use faasten_core::faasten_interface_types::{DentKind, DentOpen, dent_open, DentOpenResult, DentResult, DentCreate, dent_create};
+use faasten_interface_types::{dent_create, dent_open, DentKind, dent_update, DentCreate, 
+    DentOpen, DentOpenResult, DentResult, DentUpdate, Gate, Service};
 use faasten_core::fs::{lmdb, BackingStore, FS, DirEntry, ROOT_REF};
 
 use anyhow::{Result, Error};
@@ -66,6 +67,25 @@ host_fn!(
     }
 );
 
+//used in dent open
+struct DentKindWrap {
+    kind: DentKind
+}
+
+impl From<&DirEntry> for DentKindWrap {
+    fn from(item: &DirEntry) -> Self {
+        match item {
+            DirEntry::Directory(_) => DentKindWrap { kind:DentKind::DentDirectory },
+            DirEntry::File(_) => DentKindWrap { kind: DentKind::DentFile },
+            DirEntry::Gate(_) => DentKindWrap { kind: DentKind::DentGate },
+            DirEntry::Blob(_) => DentKindWrap{ kind: DentKind::DentBlob },
+            DirEntry::FacetedDirectory(_) => DentKindWrap { kind: DentKind::DentFacetedDirectory },
+            DirEntry::Service(_) => DentKindWrap { kind: DentKind::DentService }
+        }
+    }
+}
+
+// INCOMPLETE
 host_fn!(
     dent_open(user_data: RuntimeState; dent_open_json: Json<DentOpen>) -> Json<DentOpenResult> {
         let state = user_data.get()?;
@@ -73,7 +93,7 @@ host_fn!(
 
         let Json(DentOpen{fd: dir_fd, entry}) = dent_open_json;
 
-        let result: Option<(u64, DentKind)> = state.dents
+        let result: Option<(u64, DentKindWrap)> = state.dents
             .get(&dir_fd)
             .cloned()
             .and_then(|base| match (base, entry.unwrap()) {
@@ -96,7 +116,7 @@ host_fn!(
             Ok(Json(DentOpenResult{
                     success: true,
                     fd: result.0,
-                    kind: result.1.into()
+                    kind: result.1.kind.into()
             }))
         } else {
             Ok(Json(DentOpenResult{
@@ -121,6 +141,7 @@ host_fn!(
     }
 );
 
+// INCOMPLETE
 host_fn!(
     dent_create(user_data: RuntimeState; dent_create_json: Json<DentCreate>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -156,9 +177,65 @@ host_fn!(
     }
 );
 
+// INCOMPLETE
+host_fn!(
+    dent_update(user_data: RuntimeState; dent_update_json: Json<DentUpdate>) -> Json<DentResult> {
+        let state = user_data.get()?;
+        let state = state.lock().unwrap();
+
+        let Json(DentUpdate{fd, kind}) = dent_update_json;
+
+        // if kind is none, return failure
+        if kind.is_none() {
+            return Ok(Json(DentResult{success: false, fd: None, data: None}))
+        }
+
+        let kind = kind.unwrap();
+
+        match kind {
+            dent_update::Kind::File(data) => {
+                if let Some(DirEntry::File(file)) = state.dents.get(&fd) {
+                    file.write(data, &state.fs).unwrap();
+                } else {
+                    return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                }
+            }
+            dent_update::Kind::Gate(Gate{..}) => todo!(),
+            dent_update::Kind::Service(Service{..}) => todo!(),
+            dent_update::Kind::Blob(_) => todo!()
+        };
+
+        Ok(Json(DentResult{
+            success: true,
+            fd: None,
+            data: None
+        }))
+    }
+);
+
+host_fn!(
+    dent_read(user_data: RuntimeState; fd: u64) -> Json<DentResult> {
+        let state = user_data.get()?;
+        let state = state.lock().unwrap();
+
+        let result = state.dents.get(&fd).and_then(|entry| {
+            match entry {
+                DirEntry::File(file) => Some(file.read(&state.fs)),
+                _ => None
+            }
+        });
+
+        Ok(Json(DentResult{
+            success: result.is_some(),
+            fd: Some(fd),
+            data: result
+        }))
+    }
+);
+
 fn main() -> Result<()> {
     let mut args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
+    if args.len() < 2 {
         return Err(Error::msg("Usage: cargo run -- pathToWasm"));
     }
     let file_path = args.pop().unwrap();
@@ -166,6 +243,7 @@ fn main() -> Result<()> {
     // set up FS object
     let dbenv = std::boxed::Box::leak(Box::new(lmdb::get_dbenv(BACKING_STORE_PATH)));
     let fs: FS<Box<dyn BackingStore>> = FS::new(Box::new(&*dbenv));
+    faasten_core::fs::utils::clear_label();
 
     // init root direntry
     let mut dents: HashMap<u64, DirEntry> = Default::default();
@@ -190,6 +268,8 @@ fn main() -> Result<()> {
         .with_function("dent_open", [PTR], [PTR], runtime_state.clone(), dent_open)
         .with_function("dent_close", [ValType::I64], [PTR], runtime_state.clone(), dent_close)
         .with_function("dent_create", [PTR], [PTR], runtime_state.clone(), dent_create)
+        .with_function("dent_update", [PTR], [PTR], runtime_state.clone(), dent_update)
+        .with_function("dent_read", [ValType::I64], [PTR], runtime_state.clone(), dent_read)
         .build()
     .unwrap();
 

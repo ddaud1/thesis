@@ -10,5 +10,4 @@ crate-type = ["cdylib"]
 extism-pdk = "1.3.0"
 serde = {version = "1.0.102", features = ["derive"]}
 labeled = { git = "https://github.com/alevy/labeled", features = ["buckle"] }
-faasten-core = { git = "https://github.com/ddaud1/faasten-core.git" }
-
+faasten-interface-types = { git = "https://github.com/ddaud1/faasten-interface-types.git" }
