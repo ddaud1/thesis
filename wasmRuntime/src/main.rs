@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use extism::*;
 use extism_convert::Json;
 use faasten_interface_types::{dent_create, dent_open, DentKind, dent_update, DentCreate, 
-    DentOpen, DentOpenResult, DentResult, DentUpdate, Gate, Service};
+    DentOpen, DentOpenResult, DentResult, DentUpdate, Gate, Service, DentLink, DentUnlink};
 use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, CURRENT_LABEL, FS, ROOT_REF};
-
+use log::warn;
 use anyhow::{Result, Error};
 use labeled::{buckle::{Buckle, Component}, Label};
 
@@ -236,6 +236,53 @@ host_fn!(
     }
 );
 
+host_fn!(
+    dent_link(user_data: RuntimeState; dent_link_json: Json<DentLink>) -> Json<DentResult> {
+        let state = user_data.get()?;
+        let state = state.lock().unwrap();
+
+        let Json(DentLink{dir_fd, name, target_fd}) = dent_link_json;
+
+        let base_dir_m = state.dents.get(&dir_fd).cloned();
+        let target_obj_m = state.dents.get(&target_fd).cloned();
+        let result = base_dir_m.zip(target_obj_m).and_then(|(base, target)| {
+            match base {
+                DirEntry::Directory(base_dir) => base_dir
+                    .link(name, target, &state.fs)
+                    .map_err(|e| Into::into(e)),
+                _ => Err(fs::FsError::NotADir)             
+            }.ok()
+        });
+
+        Ok(Json(DentResult{
+            success: result.is_some(),
+            fd: None, 
+            data: None}))
+    }
+);
+
+host_fn!(
+    dent_unlink(user_data: RuntimeState; dent_unlink_json: Json<DentUnlink>) -> Json<DentResult> {
+        let state = user_data.get()?;
+        let state = state.lock().unwrap();
+
+        let Json(DentUnlink{dir_fd, name}) = dent_unlink_json;
+
+        let result = state.dents.get(&dir_fd).cloned().and_then(|entry| {
+            match entry {
+                DirEntry::Directory(base_dir) => base_dir.unlink(&name, &state.fs).ok(),
+                _ => None
+            }
+        });
+
+        Ok(Json(DentResult{
+            success: result.unwrap_or(false),
+            fd: Some(dir_fd),
+            data: None
+        }))
+    }
+);
+
 fn main() -> Result<()> {
     let mut args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -247,14 +294,20 @@ fn main() -> Result<()> {
     let dbenv = std::boxed::Box::leak(Box::new(lmdb::get_dbenv(BACKING_STORE_PATH)));
     let fs: FS<Box<dyn BackingStore>> = FS::new(Box::new(&*dbenv));
     
+    /* PRIVILEGE SET TO FALSE FOR TESTING PURPOSES (OVERRIDES LABEL CHECKS). EVENTUALLY SET BACK TO TRUE! */
     // set up label and privilege
     faasten_core::fs::utils::clear_label();
-    faasten_core::fs::utils::set_my_privilge(Component::dc_true());
+    faasten_core::fs::utils::set_my_privilge(Component::dc_false());
 
     // init root direntry
     let mut dents: HashMap<u64, DirEntry> = Default::default();
-    dents.insert(0, DirEntry::Directory(ROOT_REF)); 
+    dents.insert(0, DirEntry::Directory(ROOT_REF));
 
+    // initialize fs
+    if !fs.initialize() {
+        warn!("Existing root detected.")
+    }
+ 
     let runtime_state = UserData::new(RuntimeState{
         fs,
         dents,
@@ -275,6 +328,8 @@ fn main() -> Result<()> {
         .with_function("dent_create", [PTR], [PTR], runtime_state.clone(), dent_create)
         .with_function("dent_update", [PTR], [PTR], runtime_state.clone(), dent_update)
         .with_function("dent_read", [ValType::I64], [PTR], runtime_state.clone(), dent_read)
+        .with_function("dent_link", [PTR], [PTR], runtime_state.clone(), dent_link)
+        .with_function("dent_unlink", [PTR], [PTR], runtime_state.clone(), dent_unlink)
         .build()
     .unwrap();
 
