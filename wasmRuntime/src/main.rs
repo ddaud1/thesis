@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use extism::*;
 use extism_convert::Json;
 use faasten_interface_types::{dent_create, dent_open, DentKind, dent_update, DentCreate, 
-    DentOpen, DentOpenResult, DentResult, DentUpdate, Gate, Service, DentLink, DentUnlink};
+    DentOpen, DentOpenResult, DentResult, DentUpdate, Gate, Service, DentLink, DentUnlink,
+    DentListResult};
 use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, CURRENT_LABEL, FS, ROOT_REF};
 use log::warn;
-use anyhow::{Result, Error};
 use labeled::{buckle::{Buckle, Component}, Label};
 
 
@@ -236,6 +236,7 @@ host_fn!(
     }
 );
 
+// DON'T UNDERSTAND
 host_fn!(
     dent_link(user_data: RuntimeState; dent_link_json: Json<DentLink>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -283,10 +284,50 @@ host_fn!(
     }
 );
 
-fn main() -> Result<()> {
+// DON'T UNDERSTAND
+host_fn!(
+    dent_list(user_data: RuntimeState; fd: u64) -> Json<DentListResult> {
+        let state = user_data.get()?;
+        let state = state.lock().unwrap();
+
+        let result = state.dents.get(&fd).and_then(|entry| {
+            match entry {
+                DirEntry::Directory(dir) => Ok(
+                    dir
+                        .list(&state.fs)
+                        .iter()
+                        .map(
+                            |(name, direntry)| {
+                                let kind = match direntry {
+                                    DirEntry::Directory(_) => DentKind::DentDirectory,
+                                    DirEntry::File(_) => DentKind::DentFile,
+                                    DirEntry::FacetedDirectory(_) => DentKind::DentFacetedDirectory,
+                                    DirEntry::Gate(_) => DentKind::DentGate,
+                                    DirEntry::Service(_) => DentKind::DentService,
+                                    DirEntry::Blob(_) => DentKind::DentBlob
+                                };
+
+                                (name.clone(), kind as i32)
+                            }
+                        )
+                        .collect()
+                ),
+                _ => Err(fs::FsError::NotADir)
+            }.ok()
+        });
+
+        if let Some(entries) = result {
+            Ok(Json(DentListResult{success: true, entries}))
+        } else {
+            Ok(Json(DentListResult{success: true, entries: Default::default()}))
+        }
+    }
+);
+
+fn main() -> Result<(), & 'static str> {
     let mut args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        return Err(Error::msg("Usage: cargo run -- pathToWasm"));
+    if args.len() != 2 {
+        return Err("Usage: cargo run -- pathToWasm");
     }
     let file_path = args.pop().unwrap();
 
@@ -330,6 +371,7 @@ fn main() -> Result<()> {
         .with_function("dent_read", [ValType::I64], [PTR], runtime_state.clone(), dent_read)
         .with_function("dent_link", [PTR], [PTR], runtime_state.clone(), dent_link)
         .with_function("dent_unlink", [PTR], [PTR], runtime_state.clone(), dent_unlink)
+        .with_function("dent_list", [ValType::I64], [PTR], runtime_state.clone(), dent_list)
         .build()
     .unwrap();
 
