@@ -7,7 +7,6 @@ use faasten_interface_types::{dent_create, dent_open, DentKind, dent_update, Den
     DentOpen, DentOpenResult, DentResult, DentUpdate, Gate, Service, DentLink, DentUnlink,
     DentListResult};
 use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, CURRENT_LABEL, FS, ROOT_REF};
-use log::warn;
 use labeled::{buckle::{Buckle, Component}, Label};
 
 
@@ -346,7 +345,7 @@ fn main() -> Result<(), & 'static str> {
 
     // initialize fs
     if !fs.initialize() {
-        warn!("Existing root detected.")
+        println!("Existing root detected.");
     }
  
     let runtime_state = UserData::new(RuntimeState{
