@@ -1,4 +1,4 @@
-### Faasten WebAssembly Runtime
+# Faasten WebAssembly Runtime
 This repository contains a WebAssembly runtime which exposes the Faasten Cloudcalls to a Wasm module.  
 
 ## Execution Flow
