@@ -25,7 +25,7 @@ pub fn run() -> FnResult<String> {
     unsafe {
         let Json(label1) = get_current_label().unwrap();
         let Json(label2) = buckle_parse("Dwaha,Dwaha").unwrap();
-        let Json(label3) = taint_with_label(Json(label1.clone())).unwrap();//label2.clone().unwrap())).unwrap();
+        let Json(label3) = taint_with_label(Json(label2.clone().unwrap())).unwrap();
         let Json(label4) = get_current_label().unwrap();
         let Json(label5) = declassify(Json(Component::dc_true())).unwrap();
 
@@ -42,7 +42,8 @@ pub fn run() -> FnResult<String> {
         let Json(list_result2) = dent_list(file_fd).unwrap();
         let Json(close_result) = dent_close(file_fd).unwrap();
         
-        Ok(format!("1:{:#?}\n2:{:#?}\n3:{:#?}\n4:{:#?}\n5:{:#?}
+        Ok(format!("\n1: get current label {:#?}\n2: buckle parse {:#?}\n3: taint with label {:#?}
+            \n4: get current label {:#?}\n5: declassify {:#?}
             \n6: create result {:#?}\n7: update result {:#?}\n8: read result {:#?}\n9: link result 1 {:#?}
             \n10: link result 2 {:#?}\n11: unlink result {:#?}\n12: link result 3 {:#?}
             \n13: list result 1 {:#?}\n14: list result 2 {:#?}\nclose result {:#?}", 
