@@ -7,6 +7,6 @@ The Wasm module imports the Cloudcall functions which are provided from the runt
 the imported CloudCalls.
 
 ## How to Run
-1. In the function directore, compile the function crate to a .wasm with the following command: ```cargo build --target wasm32-unknown-unknown ```
+1. In the function directory, compile the function crate to a .wasm with the following command: ```cargo build --target wasm32-unknown-unknown ```
 2. In the wasmRuntime directory, execute the following command: ```cargo run -- ../function/target/wasm32-unknown-unknown/debug/function.wasm```
    
