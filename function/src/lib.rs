@@ -22,7 +22,7 @@ pub fn run() -> FnResult<String> {
     unsafe {
         let Json(label1) = get_current_label().unwrap();
         let Json(label2) = buckle_parse("Dwaha,Dwaha").unwrap();
-        let Json(label3) = taint_with_label(Json(label2.clone().unwrap())).unwrap();
+        let Json(label3) = taint_with_label(Json(label1.clone())).unwrap();//label2.clone().unwrap())).unwrap();
         let Json(label4) = get_current_label().unwrap();
         let Json(label5) = declassify(Json(Component::dc_true())).unwrap();
 
@@ -33,8 +33,8 @@ pub fn run() -> FnResult<String> {
         let Json(read_result) = dent_read(fd).unwrap();
         let Json(close_result) = dent_close(fd).unwrap();
         
-        Ok(format!("1:{:#?}\n2:{:#?}\n3:{:#?}\n4:{:#?}\n5:{:#?}\n6: create result 
-            {:#?}\n7: update result {:#?}\n8: read result {:#?}\n9: close result {:#?}", 
+        Ok(format!("1:{:#?}\n2:{:#?}\n3:{:#?}\n4:{:#?}\n5:{:#?}\n
+            6: create result {:#?}\n7: update result {:#?}\n8: read result {:#?}\n9: close result {:#?}", 
             label1, 
             label2.unwrap(), 
             label3,

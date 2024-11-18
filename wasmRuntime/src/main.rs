@@ -5,15 +5,13 @@ use extism::*;
 use extism_convert::Json;
 use faasten_interface_types::{dent_create, dent_open, DentKind, dent_update, DentCreate, 
     DentOpen, DentOpenResult, DentResult, DentUpdate, Gate, Service};
-use faasten_core::fs::{lmdb, BackingStore, FS, DirEntry, ROOT_REF};
+use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, CURRENT_LABEL, FS, ROOT_REF};
 
 use anyhow::{Result, Error};
 use labeled::{buckle::{Buckle, Component}, Label};
 
 
 struct RuntimeState {
-    current_label: Buckle,
-    current_privilege: Component,
     fs: FS<Box<dyn BackingStore>>,
     dents: HashMap<u64, DirEntry>,
     max_dent_id: u64
@@ -24,10 +22,9 @@ const BACKING_STORE_PATH : &str = "./backing.fstn";
 
 host_fn!(
     get_current_label(user_data: RuntimeState;) -> Json<Buckle> {
-        let state = user_data.get()?;
-        let state = state.lock().unwrap();
-        
-        Ok(Json(state.current_label.clone()))
+        Ok(Json(CURRENT_LABEL
+            .with(|cl| Buckle::from(cl.borrow().clone()))
+        ))
     }
 );
 
@@ -40,30 +37,36 @@ host_fn!(
 
 host_fn!(
     taint_with_label(user_data: RuntimeState; input_label_json: Json<Buckle>) -> Json<Buckle> {
-        let state = user_data.get()?;
-        let mut state = state.lock().unwrap();
-        
         let Json(input_label) = input_label_json;
-        let new_label = state.current_label.clone().lub(input_label);
-        
-        state.current_label = new_label.clone();
-        Ok(Json(new_label.clone()))
+        Ok(Json(CURRENT_LABEL
+            .with(|cl| {
+                let new_label = cl.borrow().clone().lub(input_label);
+                *cl.borrow_mut() = new_label;//cl.clone().borrow().lub(input_label);
+                Buckle::from(cl.borrow().clone())
+            })
+        ))
     }
 );
 
 host_fn!(
     declassify(user_data: RuntimeState; target_secrecy_json: Json<Component>) -> Json<Buckle> {
-        let state = user_data.get()?;
-        let mut state = state.lock().unwrap();
-
         let Json(target_secrecy) = target_secrecy_json;
 
-        if (target_secrecy.clone() & state.current_privilege.clone()).implies(&state.current_label.secrecy) {
-            let new_label = Buckle::new(target_secrecy.clone(), state.current_label.integrity.clone());
-            state.current_label = new_label.clone();
-        } 
-        
-        Ok(Json(state.current_label.clone()))
+        let res = fs::utils::declassify(target_secrecy);
+        match res {
+            Ok(l) | Err(l) => Ok(Json(l))
+        }
+    }
+);
+
+// DON'T UNDERSTAND
+host_fn!(
+    root(user_data: RuntimeState;) -> Json<DentResult> {
+        Ok(Json(DentResult{
+            success: true,
+            fd: None,
+            data: None
+        }))
     }
 );
 
@@ -240,18 +243,19 @@ fn main() -> Result<()> {
     }
     let file_path = args.pop().unwrap();
 
-    // set up FS object
+    // set up FS object, label, and privilege
     let dbenv = std::boxed::Box::leak(Box::new(lmdb::get_dbenv(BACKING_STORE_PATH)));
     let fs: FS<Box<dyn BackingStore>> = FS::new(Box::new(&*dbenv));
+    
+    // set up label and privilege
     faasten_core::fs::utils::clear_label();
+    faasten_core::fs::utils::set_my_privilge(Component::dc_true());
 
     // init root direntry
     let mut dents: HashMap<u64, DirEntry> = Default::default();
     dents.insert(0, DirEntry::Directory(ROOT_REF)); 
 
     let runtime_state = UserData::new(RuntimeState{
-        current_label: Buckle::public(),
-        current_privilege: Component::dc_true(),
         fs,
         dents,
         max_dent_id: 1
@@ -265,6 +269,7 @@ fn main() -> Result<()> {
         .with_function("buckle_parse", [PTR], [PTR], runtime_state.clone(), buckle_parse)
         .with_function("taint_with_label", [PTR], [PTR], runtime_state.clone(), taint_with_label)
         .with_function("declassify", [PTR], [PTR], runtime_state.clone(), declassify)
+        .with_function("root", [], [PTR], runtime_state.clone(), root)
         .with_function("dent_open", [PTR], [PTR], runtime_state.clone(), dent_open)
         .with_function("dent_close", [ValType::I64], [PTR], runtime_state.clone(), dent_close)
         .with_function("dent_create", [PTR], [PTR], runtime_state.clone(), dent_create)
