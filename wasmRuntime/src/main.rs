@@ -4,16 +4,21 @@ use std::collections::HashMap;
 use extism::*;
 use extism_convert::Json;
 use faasten_interface_types::{dent_create, dent_open, DentKind, dent_update, DentCreate, 
-    DentOpen, DentOpenResult, DentResult, DentUpdate, Gate, Service, DentLink, DentUnlink,
+    DentOpen, DentOpenResult, DentResult, DentUpdate, gate, Service, DentLink, DentUnlink,
     DentListResult};
-use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, CURRENT_LABEL, FS, ROOT_REF};
+use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, DirectGate, Gate, HttpVerb, RedirectGate, CURRENT_LABEL, FS, ROOT_REF};
+use faasten_core::blobstore::{Blob, Blobstore, NewBlob};
 use labeled::{buckle::{Buckle, Component}, Label};
 
 
 struct RuntimeState {
     fs: FS<Box<dyn BackingStore>>,
+    blobstore: Blobstore,
     dents: HashMap<u64, DirEntry>,
-    max_dent_id: u64
+    max_dent_id: u64,
+    blobs: HashMap<u64, Blob>,
+    max_blob_id: u64,
+    create_blobs: HashMap<u64, NewBlob>
 }
 
 const BACKING_STORE_PATH : &str = "./backing.fstn";
@@ -58,12 +63,11 @@ host_fn!(
     }
 );
 
-// DON'T UNDERSTAND
 host_fn!(
     root(user_data: RuntimeState;) -> Json<DentResult> {
         Ok(Json(DentResult{
             success: true,
-            fd: None,
+            fd: Some(0),
             data: None
         }))
     }
@@ -87,7 +91,6 @@ impl From<&DirEntry> for DentKindWrap {
     }
 }
 
-// INCOMPLETE
 host_fn!(
     dent_open(user_data: RuntimeState; dent_open_json: Json<DentOpen>) -> Json<DentOpenResult> {
         let state = user_data.get()?;
@@ -110,7 +113,33 @@ host_fn!(
                         (res_id, dent.into())
                     })
                 }
-                _ => todo!()
+                (
+                    // Case #2: base = a FacetedDirectory object. entry = a Facet enum. Looking to open an object by it's label
+                    DirEntry::FacetedDirectory(base_dir),
+                    dent_open::Entry::Facet(label)
+                ) => {
+                    let dent = DirEntry::Directory(base_dir.open(&label.into(), &state.fs));
+                    let res_id = state.max_dent_id;
+                    let _ = state.dents.insert(res_id, dent.clone());
+                    state.max_dent_id += 1;
+                    Some((res_id, (&dent).into()))
+                }
+                (
+                    // Case #3: base = a FacetedDirectory object. entry = a Name enum. Name contains a string which represent a label
+                    DirEntry::FacetedDirectory(base_dir),
+                    dent_open::Entry::Name(label_name)
+                ) => {
+                    if let Ok(label) = Buckle::parse(label_name.as_str()) {
+                        let dent = DirEntry::Directory(base_dir.open(&label, &state.fs));
+                        let res_id = state.max_dent_id;
+                        let _ = state.dents.insert(res_id, dent.clone());
+                        state.max_dent_id += 1;
+                        Some((res_id, (&dent).into()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None
             });
         
         // return a DentOpenResult indicating success or failure
@@ -143,7 +172,6 @@ host_fn!(
     }
 );
 
-// INCOMPLETE
 host_fn!(
     dent_create(user_data: RuntimeState; dent_create_json: Json<DentCreate>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -160,26 +188,127 @@ host_fn!(
         let kind = kind.unwrap();
         let label = label.unwrap_or(Buckle::public());
 
-        let entry: DirEntry = match kind {
-            dent_create::Kind::Directory => state.fs.create_directory(label),
-            dent_create::Kind::File => state.fs.create_file(label),
-            dent_create::Kind::FacetedDirectory => state.fs.create_faceted_directory(),
-            _ => todo!()
+
+        let maybe_entry: Option<DirEntry> = match kind {
+            dent_create::Kind::Directory => Some(state.fs.create_directory(label)),
+            dent_create::Kind::File => Some(state.fs.create_file(label)),
+            dent_create::Kind::FacetedDirectory => Some(state.fs.create_faceted_directory()),
+            dent_create::Kind::Blob(blobfd) => {
+                // get blob from blobs table. create a blob entry in dents table which wraps around the blob name
+                let blob = state.blobs.get(&blobfd);
+                
+                if blob.is_some() { state.fs.create_blob(label, blob.unwrap().name.clone()).ok() }
+                else {None}
+            }
+            dent_create::Kind::Gate(faasten_interface_types::Gate {kind: gate_kind}) => {
+                if gate_kind.is_none() {
+                    None
+                } 
+                else {
+                    let gate_kind = gate_kind.unwrap();
+                    match gate_kind {
+                        // Case #1: creating a direct gate
+                        gate::Kind::Direct(dg) => {
+                            let function = dg.function.unwrap();
+                            
+                            // get the function's app image
+                            let Some(DirEntry::Blob(app_image)) = state.dents.get(&function.app_image)
+                            else {
+                                log::info!("Failed to read function's app image when creating gate");
+                                return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                            };
+
+                            // get the function's runtime image
+                            let Some(DirEntry::Blob(runtime_image)) = state.dents.get(&function.runtime_image)
+                            else {
+                                log::info!("Failed to read function's runtime image when creating gate");
+                                return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                            };
+
+                            // create an internal version of the function
+                            let new_func = faasten_core::fs::Function {
+                                memory: function.memory as usize,
+                                app_image: app_image.get(&state.fs).unwrap().unlabel().clone(),
+                                runtime_image: runtime_image.get(&state.fs).unwrap().unlabel().clone(),
+                                kernel: "Kernel Not Used".to_string()
+                            };
+
+                            // create the direct gate
+                            state.fs.create_direct_gate(label, 
+                                DirectGate {
+                                    privilege: dg.privilege.unwrap().into(),
+                                    invoker_integrity_clearance: dg.invoker_integrity_clearance.unwrap().into(),
+                                    declassify: dg.declassify.map(|d| d.into()).unwrap_or(Component::dc_true()),
+                                    function: new_func
+                                }
+                            ).ok()
+                        }
+                        // Case #2: creating a redirect gate
+                        gate::Kind::Redirect(rdg) => {
+                            let maybe_inner_gate = state.dents.get(&rdg.gate);
+                            
+                            if let Some(DirEntry::Gate(gate_objref)) = maybe_inner_gate {
+                                state.fs.create_redirect_gate(label, 
+                                    RedirectGate {
+                                        privilege: rdg.privilege.unwrap().into(),
+                                        invoker_integrity_clearance: rdg.invoker_integrity_clearance.unwrap().into(),
+                                        declassify: rdg.declassify.map(|d| d.into()).unwrap_or(Component::dc_true()),
+                                        gate: *gate_objref
+                                    }
+                                ).ok()
+                            } else {
+                                log::info!("Failed to get inner gate when creating redirect gate");
+                                return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                            }
+                        }
+                    }
+                }
+            },
+            dent_create::Kind::Service(Service {
+                taint,
+                privilege,
+                invoker_integrity_clearance,
+                url,
+                verb,
+                mut headers
+            }) => {
+                let verb = HttpVerb::from_i32(verb).unwrap_or(HttpVerb::HEAD);
+                let headers: std::collections::BTreeMap<String, String> = headers.drain().collect();
+                
+                state.fs.create_service(label, 
+                    faasten_core::fs::Service {
+                        taint: taint.unwrap().into(),
+                        privilege: privilege.unwrap().into(),
+                        invoker_integrity_clearance: invoker_integrity_clearance.unwrap().into(),
+                        url,
+                        verb,
+                        headers
+                    }
+                ).ok()
+            }
         };
 
-        let res_id = state.max_dent_id;
-        let _ = state.dents.insert(res_id, entry);
-        state.max_dent_id += 1;
+        // if entry is valid, insert into dents table
+        if let Some(entry) = maybe_entry {
+            let res_id = state.max_dent_id;
+            let _ = state.dents.insert(res_id, entry);
+            state.max_dent_id += 1;
 
-        Ok(Json(DentResult{
-            success: true,
-            fd: Some(res_id),
-            data: None
-        }))
+            Ok(Json(DentResult{
+                success: true,
+                fd: Some(res_id),
+                data: None
+            }))
+        } else {
+            Ok(Json(DentResult{
+                success: false,
+                fd: None,
+                data: None
+            }))
+        }
     }
 );
 
-// INCOMPLETE
 host_fn!(
     dent_update(user_data: RuntimeState; dent_update_json: Json<DentUpdate>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -194,24 +323,166 @@ host_fn!(
 
         let kind = kind.unwrap();
 
-        match kind {
+        let result = match kind {
             dent_update::Kind::File(data) => {
-                if let Some(DirEntry::File(file)) = state.dents.get(&fd) {
-                    file.write(data, &state.fs).unwrap();
-                } else {
+                if let Some(DirEntry::File(file_objref)) = state.dents.get(&fd) {
+                    file_objref.write(data, &state.fs).ok()
+                } else { None }
+            }
+            dent_update::Kind::Blob(blobfd) => {
+                let new_blob = state.blobs.get(&blobfd);
+                if new_blob.is_none() {
+                    log::info!("Failed to update object with fd {}", fd);
                     return Ok(Json(DentResult{success: false, fd: None, data: None}));
                 }
+                let new_blob = new_blob.unwrap();
+
+                if let Some(DirEntry::Blob(blob_objref)) = state.dents.get(&fd) {
+                    blob_objref.replace(new_blob.name.clone(), &state.fs).ok()
+                } else { None }
             }
-            dent_update::Kind::Gate(Gate{..}) => todo!(),
-            dent_update::Kind::Service(Service{..}) => todo!(),
-            dent_update::Kind::Blob(_) => todo!()
+            dent_update::Kind::Gate(faasten_interface_types::Gate { kind }) => {
+                if let Some(DirEntry::Gate(gate_objref)) = state.dents.get(&fd) {
+                    if let Some( kind ) = kind {
+                        match kind {
+                            // Case #1: replacing a direct gate
+                            gate::Kind::Direct(dg_intf) => {
+                                // will use this to replace the old gate in the backing store
+                                let mut new_gate;
+                                
+                                // get the old gate from the backing store
+                                if let Some(Gate::Direct(dg_core)) = gate_objref.get(&state.fs).map(|g| g.unlabel().clone()) {
+                                    new_gate = dg_core;
+                                } else {
+                                    log::info!("Failed to update object with fd {}", fd);
+                                    return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                                }
+
+                                // replace gate's function field, if user provided one
+                                if let Some(function) = dg_intf.function {
+                                    // replace function's fields if user provided a valid fd for them
+
+                                    // replacing app image
+                                    if function.app_image > 0 {
+                                        let Some(DirEntry::Blob(app_image)) = state.dents.get(&function.app_image) 
+                                        else {
+                                            log::info!("Failed to update object with fd {}", fd);
+                                            return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                                        };
+
+                                        new_gate.function.app_image = app_image.get(&state.fs).unwrap().unlabel().clone();
+                                    }
+
+                                    // replacing runtime image
+                                    if function.runtime_image > 0 {
+                                        let Some(DirEntry::Blob(runtime_image)) = state.dents.get(&function.runtime_image)
+                                        else {
+                                            log::info!("Failed to update object with fd {}", fd);
+                                            return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                                        };
+
+                                        new_gate.function.runtime_image = runtime_image.get(&state.fs).unwrap().unlabel().clone();
+                                    }
+
+                                    // kernel not used, so not replaced
+                                    
+                                    // replacing memory
+                                    if function.memory > 0 {
+                                        new_gate.function.memory = function.memory as usize;
+                                    }
+                                }
+
+                                // replace gate's privilege, if user provided one
+                                if let Some(privilege) = dg_intf.privilege {
+                                    new_gate.privilege = privilege.into();
+                                }
+
+                                // replace gate's invoker integrity clearance, if user provided one
+                                if let Some(invoker_integrity_clearance) = dg_intf.invoker_integrity_clearance {
+                                    new_gate.invoker_integrity_clearance = invoker_integrity_clearance.into();
+                                }
+
+                                gate_objref.replace(Gate::Direct(new_gate), &state.fs).ok()
+                            }
+                            // Case #2 replacing an indirect gate
+                            gate::Kind::Redirect(rdg_intf) => {
+                                // will use this to replace the old gate in the backing store
+                                let mut new_gate;
+
+                                // get the old gate from the backing store
+                                if let Some(Gate::Redirect(rdg_core)) = gate_objref.get(&state.fs).map(|g| g.unlabel().clone()) {
+                                    new_gate = rdg_core;
+                                } else {
+                                    log::info!("Failed to update object with fd {}", fd);
+                                    return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                                }
+
+                                // replace inner gate, if user provided a valid fd for it
+                                if rdg_intf.gate > 0 {
+                                    if let Some(DirEntry::Gate(inner_gate_objref)) = state.dents.get(&rdg_intf.gate) {
+                                        new_gate.gate = *inner_gate_objref;
+                                    } else{
+                                        log::info!("Failed to update object with fd {}", fd);
+                                        return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                                    }
+                                }
+
+                                // replace gate's privilege, if user provided one
+                                if let Some(privilege) = rdg_intf.privilege {
+                                    new_gate.privilege = privilege.into();
+                                }
+
+                                // replace gate's invoker integrity clearance, if user provided one
+                                if let Some(invoker_integrity_clearance) = rdg_intf.invoker_integrity_clearance {
+                                    new_gate.invoker_integrity_clearance = invoker_integrity_clearance;
+                                }
+
+                                gate_objref.replace(Gate::Redirect(new_gate), &state.fs).ok()
+                            }
+                        }
+                    } else { None }
+                } else { None }
+            },
+            dent_update::Kind::Service( Service{
+                taint,
+                privilege,
+                invoker_integrity_clearance,
+                url,
+                verb,
+                mut headers
+            } ) => {
+                if let Some(DirEntry::Service(service_objref)) = state.dents.get(&fd) {
+                    let verb = HttpVerb::from_i32(verb).unwrap_or(HttpVerb::HEAD).into();
+                    let headers: std::collections::BTreeMap<String, String> = headers.drain().collect();
+                    
+                    service_objref.replace(
+                        faasten_core::fs::Service {
+                            taint: taint.unwrap().into(),
+                            privilege: privilege.unwrap().into(),
+                            invoker_integrity_clearance: invoker_integrity_clearance.unwrap().into(),
+                            url,
+                            verb,
+                            headers
+                        },
+                        &state.fs
+                    ).ok()
+                } else {
+                    None
+                }
+            }
         };
 
-        Ok(Json(DentResult{
-            success: true,
-            fd: None,
-            data: None
-        }))
+        if result.is_some() {
+            Ok(Json(DentResult{
+                success: true,
+                fd: None,
+                data: None
+            }))
+        } else {
+            log::info!("Failed to update object with fd {}", fd);
+            return Ok(Json(DentResult{success: false, fd: None, data: None}));
+        }
+        
     }
 );
 
@@ -235,7 +506,6 @@ host_fn!(
     }
 );
 
-// DON'T UNDERSTAND
 host_fn!(
     dent_link(user_data: RuntimeState; dent_link_json: Json<DentLink>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -283,7 +553,6 @@ host_fn!(
     }
 );
 
-// DON'T UNDERSTAND
 host_fn!(
     dent_list(user_data: RuntimeState; fd: u64) -> Json<DentListResult> {
         let state = user_data.get()?;
@@ -318,12 +587,17 @@ host_fn!(
         if let Some(entries) = result {
             Ok(Json(DentListResult{success: true, entries}))
         } else {
-            Ok(Json(DentListResult{success: true, entries: Default::default()}))
+            Ok(Json(DentListResult{success: false, entries: Default::default()}))
         }
     }
 );
 
 fn main() -> Result<(), & 'static str> {
+    // set RUST_LOG environment variable to configure log level
+    let env = env_logger::Env::default()
+        .filter_or("RUST_LOG", "warn");
+    env_logger::init_from_env(env);
+
     let mut args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         return Err("Usage: cargo run -- pathToWasm");
@@ -350,8 +624,12 @@ fn main() -> Result<(), & 'static str> {
  
     let runtime_state = UserData::new(RuntimeState{
         fs,
+        blobstore: Blobstore::default(),
         dents,
-        max_dent_id: 1
+        max_dent_id: 1,
+        blobs: Default::default(),
+        max_blob_id: 1,
+        create_blobs: Default::default()
     });
 
     let wasm_obj = Wasm::file(file_path);
