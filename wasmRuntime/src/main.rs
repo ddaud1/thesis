@@ -25,6 +25,8 @@ struct RuntimeState {
 }
 
 const BACKING_STORE_PATH : &str = "./backing.fstn";
+const BLOBSTORE_BASE_DIR_PATH: &str = "./blobs";
+const BLOBSTORE_TMP_PATH: &str = "./tmp";
 
 
 host_fn!(
@@ -531,10 +533,11 @@ host_fn!(
             }.ok()
         });
 
-        Ok(Json(DentResult{
+        Ok(Json(DentResult {
             success: result.is_some(),
             fd: None, 
-            data: None}))
+            data: None
+        }))
     }
 );
 
@@ -713,7 +716,7 @@ host_fn!(
                                     faasten_interface_types::RedirectGate { 
                                         privilege: Some(rdg_core.privilege.clone()), 
                                         invoker_integrity_clearance: Some(rdg_core.invoker_integrity_clearance.clone()), 
-                                        gate: 0, 
+                                        gate: 0, // unused field in this case
                                         declassify: Some(rdg_core.declassify.clone())
                                     }
                                 ))
@@ -904,13 +907,18 @@ fn main() -> Result<(), & 'static str> {
  
     let runtime_state = UserData::new(RuntimeState{
         fs,
-        blobstore: Blobstore::default(),
+        blobstore: Blobstore::new(BLOBSTORE_BASE_DIR_PATH.into(), BLOBSTORE_TMP_PATH.into()),
         dents,
         max_dent_id: 1,
         blobs: Default::default(),
         max_blob_id: 1,
         create_blobs: Default::default()
     });
+
+    // set up directories for blobstore
+    let _ = std::fs::create_dir(BLOBSTORE_BASE_DIR_PATH);
+    let _ = std::fs::create_dir(BLOBSTORE_TMP_PATH);
+
 
     let wasm_obj = Wasm::file(file_path);
     let manifest = Manifest::new([wasm_obj]);
