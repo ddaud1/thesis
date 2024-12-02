@@ -1,12 +1,15 @@
 use core::str;
 use std::env;
 use std::collections::HashMap;
+use std::io::Write;
 use extism::*;
 use extism_convert::Json;
-use faasten_interface_types::{dent_create, dent_open, DentKind, dent_update, DentCreate, 
-    DentOpen, DentOpenResult, DentResult, DentUpdate, gate, Service, DentLink, DentUnlink,
-    DentListResult};
-use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, DirectGate, Gate, HttpVerb, RedirectGate, CURRENT_LABEL, FS, ROOT_REF};
+use faasten_interface_types::{dent_create, dent_open, dent_update, gate,
+    DentCreate, DentKind, DentLink, DentListResult, DentLsFaceted, DentLsFacetedResult, DentLsGateResult,
+    DentOpen, DentOpenResult, DentResult, DentUnlink, DentUpdate, Service,
+    DentInvoke, DentInvokeResult, BlobWrite, BlobResult, BlobFinalize, BlobRead, BlobClose};
+use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, DirectGate, Gate, 
+    HttpVerb, RedirectGate, CURRENT_LABEL, FS, ROOT_REF};
 use faasten_core::blobstore::{Blob, Blobstore, NewBlob};
 use labeled::{buckle::{Buckle, Component}, Label};
 
@@ -209,7 +212,11 @@ host_fn!(
                     match gate_kind {
                         // Case #1: creating a direct gate
                         gate::Kind::Direct(dg) => {
-                            let function = dg.function.unwrap();
+                            let Some(function) = dg.function
+                            else {
+                                log::info!("No function provided when creating gate");
+                                return Ok(Json(DentResult{success: false, fd: None, data: None}));
+                            };
                             
                             // get the function's app image
                             let Some(DirEntry::Blob(app_image)) = state.dents.get(&function.app_image)
@@ -226,7 +233,7 @@ host_fn!(
                             };
 
                             // create an internal version of the function
-                            let new_func = faasten_core::fs::Function {
+                            let new_func = fs::Function {
                                 memory: function.memory as usize,
                                 app_image: app_image.get(&state.fs).unwrap().unlabel().clone(),
                                 runtime_image: runtime_image.get(&state.fs).unwrap().unlabel().clone(),
@@ -276,7 +283,7 @@ host_fn!(
                 let headers: std::collections::BTreeMap<String, String> = headers.drain().collect();
                 
                 state.fs.create_service(label, 
-                    faasten_core::fs::Service {
+                    fs::Service {
                         taint: taint.unwrap().into(),
                         privilege: privilege.unwrap().into(),
                         invoker_integrity_clearance: invoker_integrity_clearance.unwrap().into(),
@@ -456,7 +463,7 @@ host_fn!(
                     let headers: std::collections::BTreeMap<String, String> = headers.drain().collect();
                     
                     service_objref.replace(
-                        faasten_core::fs::Service {
+                        fs::Service {
                             taint: taint.unwrap().into(),
                             privilege: privilege.unwrap().into(),
                             invoker_integrity_clearance: invoker_integrity_clearance.unwrap().into(),
@@ -554,14 +561,14 @@ host_fn!(
 );
 
 host_fn!(
-    dent_list(user_data: RuntimeState; fd: u64) -> Json<DentListResult> {
+    dent_list(user_data: RuntimeState; dir_fd: u64) -> Json<DentListResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
-        let result = state.dents.get(&fd).and_then(|entry| {
+        let result = state.dents.get(&dir_fd).and_then(|entry| {
             match entry {
-                DirEntry::Directory(dir) => Ok(
-                    dir
+                DirEntry::Directory(dir_objref) => Some(
+                    dir_objref
                         .list(&state.fs)
                         .iter()
                         .map(
@@ -580,14 +587,287 @@ host_fn!(
                         )
                         .collect()
                 ),
-                _ => Err(fs::FsError::NotADir)
-            }.ok()
+                _ => {
+                    log::info!("List failed. Not a directory.");
+                    None
+                }
+            }
         });
 
         if let Some(entries) = result {
             Ok(Json(DentListResult{success: true, entries}))
         } else {
             Ok(Json(DentListResult{success: false, entries: Default::default()}))
+        }
+    }
+);
+
+host_fn!(
+    dent_ls_faceted(user_data: RuntimeState; dent_ls_faceted_json: Json<DentLsFaceted>) -> Json<DentLsFacetedResult> {
+        let state = user_data.get()?;
+        let state = state.lock().unwrap();
+
+        let Json(DentLsFaceted { fd: fdir_fd, clearance }) = dent_ls_faceted_json;
+        
+        // clearance defaults to public
+        let clearance = clearance.unwrap_or(Buckle::public());
+
+        let result  = state.dents.get(&fdir_fd).and_then(|entry| {
+            match entry {
+                DirEntry::FacetedDirectory(fdir_objref) => Some(
+                    fdir_objref
+                        .list(&state.fs, &clearance)
+                        .iter()
+                        .map(|(label, _)| label.clone().into())
+                        .collect()
+                ),
+                _ => {
+                    log::info!("List failed. Not a faceted directory.");
+                    None
+                }
+            }
+        });
+
+        if let Some(facets) = result {
+            Ok(Json(DentLsFacetedResult {success: true, facets} ))
+        } else {
+            Ok(Json(DentLsFacetedResult{success: false, facets: Default::default()}))
+        }
+    }
+);
+
+host_fn!(
+    dent_ls_gate(user_data: RuntimeState; gate_fd: u64) -> Json<DentLsGateResult> {
+        let state = user_data.get()?;
+        let mut state = state.lock().unwrap();
+
+        let result = state.dents.get(&gate_fd).map(Clone::clone).and_then(|entry| {
+            match entry {
+                DirEntry::Gate(gate_objref) => Some(
+                    match gate_objref.get(&state.fs).unwrap().unlabel() {
+                        // Case #1: List a Direct Gate
+                        Gate::Direct(dg_core) => {
+                            // open the gate's app image and get its fd
+                            let app_image_fd = {
+                                let blob_id = state.max_blob_id;
+                                state.max_blob_id += 1;
+                                
+                                let Some(blob) = state
+                                    .blobstore
+                                    .open(dg_core.function.app_image.clone())
+                                    .ok()
+                                else {
+                                    log::info!("List failed. Failed to open app image.");
+                                    return None;
+                                };
+                                state.blobs.insert(blob_id, blob);
+                                
+                                blob_id
+                            };
+
+                            // open the gate's runtime image and get its fd
+                            let runtime_image_fd = {
+                                let blob_id = state.max_blob_id;
+                                state.max_blob_id += 1;
+
+                                let Some(blob) = state
+                                    .blobstore
+                                    .open(dg_core.function.runtime_image.clone())
+                                    .ok()
+                                else {
+                                    log::info!("List failed. Failed to open runtime image.");
+                                    return None;
+                                };
+                                state.blobs.insert(blob_id, blob);
+
+                                blob_id
+                            };
+
+                            // kernel image not used so don't open
+                            
+                            // create the interface version of the function
+                            let function_intf = faasten_interface_types::Function {
+                                memory: dg_core.function.memory as u64,
+                                app_image: app_image_fd,
+                                runtime_image: runtime_image_fd,
+                                kernel: 0 // not used
+                            };
+
+                            // return user-side direct gate
+                            faasten_interface_types::Gate {
+                                kind: Some(gate::Kind::Direct(
+                                    faasten_interface_types::DirectGate { 
+                                        privilege: Some(dg_core.privilege.clone()), 
+                                        invoker_integrity_clearance: Some(dg_core.invoker_integrity_clearance.clone()), 
+                                        function: Some(function_intf), 
+                                        declassify: Some(dg_core.declassify.clone())
+                                    }
+                                ))
+                            }
+                        }
+                        // Case #2: List a Redirect Gate
+                        Gate::Redirect(rdg_core) => {
+                            // return user-side redirect gate
+                            faasten_interface_types::Gate {
+                                kind: Some(gate::Kind::Redirect(
+                                    faasten_interface_types::RedirectGate { 
+                                        privilege: Some(rdg_core.privilege.clone()), 
+                                        invoker_integrity_clearance: Some(rdg_core.invoker_integrity_clearance.clone()), 
+                                        gate: 0, 
+                                        declassify: Some(rdg_core.declassify.clone())
+                                    }
+                                ))
+                            }
+                        }
+                    }
+                ),
+                _ => {
+                    log::info!("List failed. Not a gate.");
+                    None
+                }
+            }
+        });
+
+        Ok(Json(DentLsGateResult {success: result.is_some(), gate: result}))
+    }
+);
+
+host_fn!(
+    dent_invoke(user_data: RuntimeState; dent_invoke_json: Json<DentInvoke>) -> Json<DentInvokeResult> {
+        let state = user_data.get()?;
+        let state = state.lock().unwrap();
+
+        let Json(DentInvoke { .. }) = dent_invoke_json;
+
+        // SKIPPING UNTIL I UNDERSTAND IT BETTER
+
+        Ok(Json(DentInvokeResult{success: false, fd: None, data: vec![], headers: Default::default()}))
+    }
+);
+
+host_fn!(
+    dent_get_blob(user_data: RuntimeState; fd: u64) -> Json<BlobResult> {
+        let state = user_data.get()?;
+        let mut state = state.lock().unwrap();
+
+        match state.dents.get(&fd) {
+            Some(DirEntry::Blob(blob_objref)) => {
+                // get the blob from the blobstore using it's name in the fs
+                let blob = state
+                    .blobstore
+                    .open(blob_objref.read(&state.fs))
+                .expect("Get blob failed. Couldn't open blob");
+                
+                // insert the fetched blob in the table of open blobs
+                let blobfd = state.max_blob_id;
+                state.max_blob_id += 1;
+                let len = blob.len().expect("Get blob failed. Couldn't find blob length");
+                state.blobs.insert(blobfd, blob);
+
+                Ok(Json( BlobResult {success: true, fd: blobfd, len, data: None} ))
+            }
+            _ => Ok(Json(BlobResult {success: false, fd: 0, len: 0, data: None}))
+        }
+    }
+);
+
+host_fn!(
+    blob_create(user_data: RuntimeState;) -> Json<BlobResult> {
+        let state = user_data.get()?;
+        let mut state = state.lock().unwrap();
+
+        match state.blobstore.create() {
+            Ok(newblob) => {
+                let blobfd = state.max_blob_id;
+                state.max_blob_id += 1;
+                state.create_blobs.insert(blobfd, newblob);
+
+                Ok(Json(BlobResult {success: true, fd: blobfd, len: 0, data: None}))
+            },
+            Err(e) => Ok(Json(BlobResult{success: false, fd: 0, len: 0, data: Some(e.to_string().into())}))
+        }
+    }
+);
+
+host_fn!(
+    blob_write(user_data: RuntimeState; blob_write_json: Json<BlobWrite>) -> Json<BlobResult> {
+        let state = user_data.get()?;
+        let mut state = state.lock().unwrap();
+
+        let Json(BlobWrite { fd, data }) = blob_write_json;
+
+        if let Some(newblob) = state.create_blobs.get_mut(&fd) {
+            match newblob.write(&data) {
+                Ok(len) => Ok(Json(BlobResult { success: true, fd, len: len as u64, data: None })),
+                Err(e) => Ok(Json(BlobResult { success: false, fd, len: 0, data: Some(e.to_string().into()) }))
+            }
+        } else {
+            Ok(Json(BlobResult {success: false, fd: 0, len: 0, data: None }))
+        }
+    }
+);
+
+host_fn!(
+    blob_finalize(user_data: RuntimeState; blob_finalize_json: Json<BlobFinalize>) -> Json<BlobResult> {
+        let state = user_data.get()?;
+        let mut state = state.lock().unwrap();
+
+        let Json(BlobFinalize { fd }) = blob_finalize_json;
+
+        if let Some(newblob) = state.create_blobs.remove(&fd) {
+            let len = newblob.len() as u64;
+            
+            match state.blobstore.save(newblob) {
+                Ok(finalized_blob) => {
+                    state.blobs.insert(fd, finalized_blob);
+                    Ok(Json(BlobResult { success: true, fd,  len, data: None}))
+                }
+                Err(e) => Ok(Json(BlobResult { success: false, fd, len, data: Some(e.to_string().into()) }))
+            }
+        } else {
+            Ok(Json(BlobResult { success: false, fd, len: 0, data: None }))
+        }
+    }
+);
+
+host_fn!(
+    blob_read(user_data: RuntimeState; blob_read_json: Json<BlobRead>) -> Json<BlobResult> {
+        let state = user_data.get()?;
+        let state = state.lock().unwrap();
+
+        let Json(BlobRead { fd, offset: maybe_offset, length: maybe_length }) = blob_read_json;
+
+        // offset defaults to 0 and length defaults to 4096 bytes (4KB)
+        let offset = maybe_offset.unwrap_or(0);
+        let length = maybe_length.unwrap_or(4096);
+
+        if let Some(blob) = state.blobs.get(&fd) {
+            let mut buf = vec![0; length as usize];
+
+            match blob.read_at(&mut buf, offset) {
+                Ok(num_bytes_read) => {
+                    buf.resize(num_bytes_read, 0);
+                    Ok(Json(BlobResult { success: true, fd, len: num_bytes_read as u64, data: Some(buf) }))
+                },
+                Err(e) => Ok(Json(BlobResult { success: false, fd, len: 0, data: Some(e.to_string().into()) }))
+            }
+        } else {
+            Ok(Json(BlobResult { success: false, fd, len: 0, data: None }))
+        }
+    }
+);
+
+host_fn!(
+    blob_close(user_data: RuntimeState; blob_close_json: Json<BlobClose>) -> Json<BlobResult> {
+        let state = user_data.get()?;
+        let mut state = state.lock().unwrap();
+
+        let Json(BlobClose { fd }) = blob_close_json;
+
+        if state.blobs.remove(&fd).is_some() {
+            Ok(Json(BlobResult { success: true, fd, len: 0, data: None }))
+        } else {
+            Ok(Json(BlobResult { success: false, fd, len: 0, data: None }))
         }
     }
 );
@@ -610,8 +890,8 @@ fn main() -> Result<(), & 'static str> {
     
     /* PRIVILEGE SET TO FALSE FOR TESTING PURPOSES (OVERRIDES LABEL CHECKS). EVENTUALLY SET BACK TO TRUE! */
     // set up label and privilege
-    faasten_core::fs::utils::clear_label();
-    faasten_core::fs::utils::set_my_privilge(Component::dc_false());
+    fs::utils::clear_label();
+    fs::utils::set_my_privilge(Component::dc_false());
 
     // init root direntry
     let mut dents: HashMap<u64, DirEntry> = Default::default();
@@ -649,6 +929,15 @@ fn main() -> Result<(), & 'static str> {
         .with_function("dent_link", [PTR], [PTR], runtime_state.clone(), dent_link)
         .with_function("dent_unlink", [PTR], [PTR], runtime_state.clone(), dent_unlink)
         .with_function("dent_list", [ValType::I64], [PTR], runtime_state.clone(), dent_list)
+        .with_function("dent_ls_faceted", [PTR], [PTR], runtime_state.clone(), dent_ls_faceted)
+        .with_function("dent_ls_gate", [ValType::I64], [PTR], runtime_state.clone(), dent_ls_gate)
+        .with_function("dent_invoke", [PTR], [PTR], runtime_state.clone(), dent_invoke)
+        .with_function("dent_get_blob", [ValType::I64], [PTR], runtime_state.clone(), dent_get_blob)
+        .with_function("blob_create", [], [PTR], runtime_state.clone(), blob_create)
+        .with_function("blob_write", [PTR], [PTR], runtime_state.clone(), blob_write)
+        .with_function("blob_finalize", [PTR], [PTR], runtime_state.clone(), blob_finalize)
+        .with_function("blob_read", [PTR], [PTR], runtime_state.clone(), blob_read)
+        .with_function("blob_close", [PTR], [PTR], runtime_state.clone(), blob_close)
         .build()
     .unwrap();
 
