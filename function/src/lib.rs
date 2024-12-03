@@ -1,8 +1,6 @@
 use extism_pdk::*;
 use labeled::buckle::{Buckle, Component};
-use faasten_interface_types::{dent_create, dent_update, DentCreate, DentLink, DentListResult, 
-    DentOpen, DentOpenResult, DentResult, DentUnlink, DentUpdate, DentLsFaceted, DentLsFacetedResult,
-    DentLsGateResult, DentInvoke, DentInvokeResult, BlobResult, BlobWrite, BlobFinalize, BlobRead, BlobClose};
+use faasten_interface_types::{dent_create, dent_update, gate, BlobClose, BlobFinalize, BlobRead, BlobResult, BlobWrite, DentCreate, DentInvoke, DentInvokeResult, DentLink, DentListResult, DentLsFaceted, DentLsFacetedResult, DentLsGateResult, DentOpen, DentOpenResult, DentResult, DentUnlink, DentUpdate, DirectGate, Function, Gate};
 
 #[host_fn]
 extern "ExtismHost" {
@@ -56,13 +54,29 @@ pub fn run() -> FnResult<String> {
 
         // testing blobs
         let Json(blb_create_result) = blob_create().unwrap();
-        let blob_fd= blb_create_result.fd;
-        let Json(blb_write_result) = blob_write(Json(BlobWrite {fd: blob_fd, data: "hello, world".to_string().into()})).unwrap();
-        let Json(blb_finalize_result) = blob_finalize(Json(BlobFinalize { fd: blob_fd })).unwrap();
-        let Json(blb_dent_create_result) = dent_create(Json(DentCreate { label: Some(Buckle::public()), kind: Some(dent_create::Kind::Blob(blob_fd)) })).unwrap();
+        let blob_fd_in_blobs= blb_create_result.fd;
+        let Json(blb_write_result) = blob_write(Json(BlobWrite {fd: blob_fd_in_blobs, data: "hello, world".to_string().into()})).unwrap();
+        let Json(blb_finalize_result) = blob_finalize(Json(BlobFinalize { fd: blob_fd_in_blobs })).unwrap();
+        let Json(blb_dent_create_result) = dent_create(Json(DentCreate { label: Some(Buckle::public()), kind: Some(dent_create::Kind::Blob(blob_fd_in_blobs)) })).unwrap();
         let blob_fd_in_dents = blb_dent_create_result.fd.unwrap();
         let Json(blb_link_result) = dent_link(Json(DentLink { dir_fd: 0, name: "blob1".into(), target_fd: blob_fd_in_dents })).unwrap();
         let Json(list_result4) = dent_list(0).unwrap();
+
+        // testing gates
+        let function = Function {
+            memory: 4096,
+            app_image: blob_fd_in_dents,
+            runtime_image: blob_fd_in_dents,
+            kernel: 0
+        };
+        let gate_kind = dent_create::Kind::Gate(Gate { kind: Some(gate::Kind::Direct(DirectGate {
+            privilege: Some(Component::dc_false()),
+            invoker_integrity_clearance: Some(Component::dc_false()),
+            function: Some(function),
+            declassify: Some(Component::dc_false())
+        })) });
+
+        let Json(gate_create_result) = dent_create(Json(DentCreate {label: Some(Buckle::public()), kind: Some(gate_kind)})).unwrap();
         
         Ok(format!("\nTESTING LABELS\n\n1: get current label {:#?}\n2: buckle parse {:#?}\n3: taint with label {:#?}
             \n4: get current label {:#?}\n5: declassify {:#?}
@@ -71,8 +85,10 @@ pub fn run() -> FnResult<String> {
             \n10: link result 2 {:#?}\n11: unlink result {:#?}\n12: link result 3 {:#?}
             \n13: list result 1 {:#?}\n14: list result 2 {:#?}\n15: close result {:#?}
             \n\nTESTING BLOBS
-            \n16: blob create result: {:#?}\n17: blob write result: {:#?}\n18: blob finalize result {:#?}
-            \n19: blob dent create result: {:#?}\n20: blob link result: {:#?}\n21: list result 4: {:#?}", 
+            \n16: blob create result {:#?}\n17: blob write result {:#?}\n18: blob finalize result {:#?}
+            \n19: blob dent create result {:#?}\n20: blob link result: {:#?}\n21: list result 4 {:#?}
+            \n\nTESTING GATES
+            \n22: gate create result {:#?}", 
             label1, 
             label2.unwrap(), 
             label3,
@@ -93,7 +109,8 @@ pub fn run() -> FnResult<String> {
             blb_finalize_result,
             blb_dent_create_result,
             blb_link_result,
-            list_result4
+            list_result4,
+            gate_create_result
         ))
     }
 }
