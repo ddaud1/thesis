@@ -2,6 +2,7 @@ use core::str;
 use std::env;
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::TcpStream;
 use extism::*;
 use extism_convert::Json;
 use faasten_interface_types::{dent_create, dent_open, dent_update, gate,
@@ -9,20 +10,9 @@ use faasten_interface_types::{dent_create, dent_open, dent_update, gate,
     DentOpen, DentOpenResult, DentResult, DentUnlink, DentUpdate, Service,
     DentInvoke, DentInvokeResult, BlobWrite, BlobResult, BlobFinalize, BlobRead, BlobClose};
 use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, DirectGate, Gate, 
-    HttpVerb, RedirectGate, CURRENT_LABEL, FS, ROOT_REF};
+    HttpVerb, RedirectGate, CURRENT_LABEL, FS};
 use faasten_core::blobstore::{Blob, Blobstore, NewBlob};
 use labeled::{buckle::{Buckle, Component}, Label};
-
-
-struct RuntimeState {
-    fs: FS<Box<dyn BackingStore>>,
-    blobstore: Blobstore,
-    dents: HashMap<u64, DirEntry>,
-    max_dent_id: u64,
-    blobs: HashMap<u64, Blob>,
-    max_blob_id: u64,
-    create_blobs: HashMap<u64, NewBlob>
-}
 
 const BACKING_STORE_PATH : &str = "./backing.fstn";
 const BLOBSTORE_BASE_DIR_PATH: &str = "./blobs";
@@ -30,7 +20,7 @@ const BLOBSTORE_TMP_PATH: &str = "./tmp";
 
 
 host_fn!(
-    get_current_label(user_data: RuntimeState;) -> Json<Buckle> {
+    get_current_label(user_data: SyscallProcessor;) -> Json<Buckle> {
         Ok(Json(CURRENT_LABEL
             .with(|cl| Buckle::from(cl.borrow().clone()))
         ))
@@ -38,14 +28,14 @@ host_fn!(
 );
 
 host_fn!(
-    buckle_parse(user_data: RuntimeState; input_str: &str) -> Json<Option<Buckle>> {
+    buckle_parse(user_data: SyscallProcessor; input_str: &str) -> Json<Option<Buckle>> {
         let label = Buckle::parse(input_str).ok();
         Ok(Json(label))
     }
 );
 
 host_fn!(
-    taint_with_label(user_data: RuntimeState; input_label_json: Json<Buckle>) -> Json<Buckle> {
+    taint_with_label(user_data: SyscallProcessor; input_label_json: Json<Buckle>) -> Json<Buckle> {
         let Json(input_label) = input_label_json;
         Ok(Json(CURRENT_LABEL
             .with(|cl| {
@@ -58,7 +48,7 @@ host_fn!(
 );
 
 host_fn!(
-    declassify(user_data: RuntimeState; target_secrecy_json: Json<Component>) -> Json<Buckle> {
+    declassify(user_data: SyscallProcessor; target_secrecy_json: Json<Component>) -> Json<Buckle> {
         let Json(target_secrecy) = target_secrecy_json;
 
         let res = fs::utils::declassify(target_secrecy);
@@ -69,7 +59,7 @@ host_fn!(
 );
 
 host_fn!(
-    root(user_data: RuntimeState;) -> Json<DentResult> {
+    root(user_data: SyscallProcessor;) -> Json<DentResult> {
         Ok(Json(DentResult{
             success: true,
             fd: Some(0),
@@ -97,7 +87,7 @@ impl From<&DirEntry> for DentKindWrap {
 }
 
 host_fn!(
-    dent_open(user_data: RuntimeState; dent_open_json: Json<DentOpen>) -> Json<DentOpenResult> {
+    dent_open(user_data: SyscallProcessor; dent_open_json: Json<DentOpen>) -> Json<DentOpenResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
 
@@ -111,7 +101,7 @@ host_fn!(
                     DirEntry::Directory(base_dir),
                     dent_open::Entry::Name(name)
                 ) => {
-                    base_dir.list(&state.fs).get(&name).map(|dent| {
+                    base_dir.list(&state.env.fs).get(&name).map(|dent| {
                         let res_id = state.max_dent_id;
                         let _ = state.dents.insert(res_id, dent.clone());
                         state.max_dent_id += 1;
@@ -123,7 +113,7 @@ host_fn!(
                     DirEntry::FacetedDirectory(base_dir),
                     dent_open::Entry::Facet(label)
                 ) => {
-                    let dent = DirEntry::Directory(base_dir.open(&label.into(), &state.fs));
+                    let dent = DirEntry::Directory(base_dir.open(&label.into(), &state.env.fs));
                     let res_id = state.max_dent_id;
                     let _ = state.dents.insert(res_id, dent.clone());
                     state.max_dent_id += 1;
@@ -135,7 +125,7 @@ host_fn!(
                     dent_open::Entry::Name(label_name)
                 ) => {
                     if let Ok(label) = Buckle::parse(label_name.as_str()) {
-                        let dent = DirEntry::Directory(base_dir.open(&label, &state.fs));
+                        let dent = DirEntry::Directory(base_dir.open(&label, &state.env.fs));
                         let res_id = state.max_dent_id;
                         let _ = state.dents.insert(res_id, dent.clone());
                         state.max_dent_id += 1;
@@ -165,7 +155,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_close(user_data: RuntimeState; input_fd: u64) -> Json<DentResult> {
+    dent_close(user_data: SyscallProcessor; input_fd: u64) -> Json<DentResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
 
@@ -178,7 +168,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_create(user_data: RuntimeState; dent_create_json: Json<DentCreate>) -> Json<DentResult> {
+    dent_create(user_data: SyscallProcessor; dent_create_json: Json<DentCreate>) -> Json<DentResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
         
@@ -195,14 +185,14 @@ host_fn!(
 
 
         let maybe_entry: Option<DirEntry> = match kind {
-            dent_create::Kind::Directory => Some(state.fs.create_directory(label)),
-            dent_create::Kind::File => Some(state.fs.create_file(label)),
-            dent_create::Kind::FacetedDirectory => Some(state.fs.create_faceted_directory()),
+            dent_create::Kind::Directory => Some(state.env.fs.create_directory(label)),
+            dent_create::Kind::File => Some(state.env.fs.create_file(label)),
+            dent_create::Kind::FacetedDirectory => Some(state.env.fs.create_faceted_directory()),
             dent_create::Kind::Blob(blobfd) => {
                 // get blob from blobs table. create a blob entry in dents table which wraps around the blob name
                 let blob = state.blobs.get(&blobfd);
                 
-                if blob.is_some() { state.fs.create_blob(label, blob.unwrap().name.clone()).ok() }
+                if blob.is_some() { state.env.fs.create_blob(label, blob.unwrap().name.clone()).ok() }
                 else {None}
             }
             dent_create::Kind::Gate(faasten_interface_types::Gate {kind: gate_kind}) => {
@@ -237,13 +227,13 @@ host_fn!(
                             // create an internal version of the function
                             let new_func = fs::Function {
                                 memory: function.memory as usize,
-                                app_image: app_image.get(&state.fs).unwrap().unlabel().clone(),
-                                runtime_image: runtime_image.get(&state.fs).unwrap().unlabel().clone(),
+                                app_image: app_image.get(&state.env.fs).unwrap().unlabel().clone(),
+                                runtime_image: runtime_image.get(&state.env.fs).unwrap().unlabel().clone(),
                                 kernel: "Kernel Not Used".to_string()
                             };
 
                             // create the direct gate
-                            state.fs.create_direct_gate(label, 
+                            state.env.fs.create_direct_gate(label, 
                                 DirectGate {
                                     privilege: dg.privilege.unwrap().into(),
                                     invoker_integrity_clearance: dg.invoker_integrity_clearance.unwrap().into(),
@@ -257,7 +247,7 @@ host_fn!(
                             let maybe_inner_gate = state.dents.get(&rdg.gate);
                             
                             if let Some(DirEntry::Gate(gate_objref)) = maybe_inner_gate {
-                                state.fs.create_redirect_gate(label, 
+                                state.env.fs.create_redirect_gate(label, 
                                     RedirectGate {
                                         privilege: rdg.privilege.unwrap().into(),
                                         invoker_integrity_clearance: rdg.invoker_integrity_clearance.unwrap().into(),
@@ -284,7 +274,7 @@ host_fn!(
                 let verb = HttpVerb::from_i32(verb).unwrap_or(HttpVerb::HEAD);
                 let headers: std::collections::BTreeMap<String, String> = headers.drain().collect();
                 
-                state.fs.create_service(label, 
+                state.env.fs.create_service(label, 
                     fs::Service {
                         taint: taint.unwrap().into(),
                         privilege: privilege.unwrap().into(),
@@ -319,7 +309,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_update(user_data: RuntimeState; dent_update_json: Json<DentUpdate>) -> Json<DentResult> {
+    dent_update(user_data: SyscallProcessor; dent_update_json: Json<DentUpdate>) -> Json<DentResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
@@ -335,7 +325,7 @@ host_fn!(
         let result = match kind {
             dent_update::Kind::File(data) => {
                 if let Some(DirEntry::File(file_objref)) = state.dents.get(&fd) {
-                    file_objref.write(data, &state.fs).ok()
+                    file_objref.write(data, &state.env.fs).ok()
                 } else { None }
             }
             dent_update::Kind::Blob(blobfd) => {
@@ -347,7 +337,7 @@ host_fn!(
                 let new_blob = new_blob.unwrap();
 
                 if let Some(DirEntry::Blob(blob_objref)) = state.dents.get(&fd) {
-                    blob_objref.replace(new_blob.name.clone(), &state.fs).ok()
+                    blob_objref.replace(new_blob.name.clone(), &state.env.fs).ok()
                 } else { None }
             }
             dent_update::Kind::Gate(faasten_interface_types::Gate { kind }) => {
@@ -360,7 +350,7 @@ host_fn!(
                                 let mut new_gate;
                                 
                                 // get the old gate from the backing store
-                                if let Some(Gate::Direct(dg_core)) = gate_objref.get(&state.fs).map(|g| g.unlabel().clone()) {
+                                if let Some(Gate::Direct(dg_core)) = gate_objref.get(&state.env.fs).map(|g| g.unlabel().clone()) {
                                     new_gate = dg_core;
                                 } else {
                                     log::info!("Failed to update object with fd {}", fd);
@@ -379,7 +369,7 @@ host_fn!(
                                             return Ok(Json(DentResult{success: false, fd: None, data: None}));
                                         };
 
-                                        new_gate.function.app_image = app_image.get(&state.fs).unwrap().unlabel().clone();
+                                        new_gate.function.app_image = app_image.get(&state.env.fs).unwrap().unlabel().clone();
                                     }
 
                                     // replacing runtime image
@@ -390,7 +380,7 @@ host_fn!(
                                             return Ok(Json(DentResult{success: false, fd: None, data: None}));
                                         };
 
-                                        new_gate.function.runtime_image = runtime_image.get(&state.fs).unwrap().unlabel().clone();
+                                        new_gate.function.runtime_image = runtime_image.get(&state.env.fs).unwrap().unlabel().clone();
                                     }
 
                                     // kernel not used, so not replaced
@@ -411,7 +401,7 @@ host_fn!(
                                     new_gate.invoker_integrity_clearance = invoker_integrity_clearance.into();
                                 }
 
-                                gate_objref.replace(Gate::Direct(new_gate), &state.fs).ok()
+                                gate_objref.replace(Gate::Direct(new_gate), &state.env.fs).ok()
                             }
                             // Case #2 replacing an indirect gate
                             gate::Kind::Redirect(rdg_intf) => {
@@ -419,7 +409,7 @@ host_fn!(
                                 let mut new_gate;
 
                                 // get the old gate from the backing store
-                                if let Some(Gate::Redirect(rdg_core)) = gate_objref.get(&state.fs).map(|g| g.unlabel().clone()) {
+                                if let Some(Gate::Redirect(rdg_core)) = gate_objref.get(&state.env.fs).map(|g| g.unlabel().clone()) {
                                     new_gate = rdg_core;
                                 } else {
                                     log::info!("Failed to update object with fd {}", fd);
@@ -446,7 +436,7 @@ host_fn!(
                                     new_gate.invoker_integrity_clearance = invoker_integrity_clearance;
                                 }
 
-                                gate_objref.replace(Gate::Redirect(new_gate), &state.fs).ok()
+                                gate_objref.replace(Gate::Redirect(new_gate), &state.env.fs).ok()
                             }
                         }
                     } else { None }
@@ -473,7 +463,7 @@ host_fn!(
                             verb,
                             headers
                         },
-                        &state.fs
+                        &state.env.fs
                     ).ok()
                 } else {
                     None
@@ -496,13 +486,13 @@ host_fn!(
 );
 
 host_fn!(
-    dent_read(user_data: RuntimeState; fd: u64) -> Json<DentResult> {
+    dent_read(user_data: SyscallProcessor; fd: u64) -> Json<DentResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
         let result = state.dents.get(&fd).and_then(|entry| {
             match entry {
-                DirEntry::File(file) => Some(file.read(&state.fs)),
+                DirEntry::File(file) => Some(file.read(&state.env.fs)),
                 _ => None
             }
         });
@@ -516,7 +506,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_link(user_data: RuntimeState; dent_link_json: Json<DentLink>) -> Json<DentResult> {
+    dent_link(user_data: SyscallProcessor; dent_link_json: Json<DentLink>) -> Json<DentResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
@@ -527,7 +517,7 @@ host_fn!(
         let result = base_dir_m.zip(target_obj_m).and_then(|(base, target)| {
             match base {
                 DirEntry::Directory(base_dir) => base_dir
-                    .link(name, target, &state.fs)
+                    .link(name, target, &state.env.fs)
                     .map_err(|e| Into::into(e)),
                 _ => Err(fs::FsError::NotADir)             
             }.ok()
@@ -542,7 +532,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_unlink(user_data: RuntimeState; dent_unlink_json: Json<DentUnlink>) -> Json<DentResult> {
+    dent_unlink(user_data: SyscallProcessor; dent_unlink_json: Json<DentUnlink>) -> Json<DentResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
@@ -550,7 +540,7 @@ host_fn!(
 
         let result = state.dents.get(&dir_fd).cloned().and_then(|entry| {
             match entry {
-                DirEntry::Directory(base_dir) => base_dir.unlink(&name, &state.fs).ok(),
+                DirEntry::Directory(base_dir) => base_dir.unlink(&name, &state.env.fs).ok(),
                 _ => None
             }
         });
@@ -564,7 +554,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_list(user_data: RuntimeState; dir_fd: u64) -> Json<DentListResult> {
+    dent_list(user_data: SyscallProcessor; dir_fd: u64) -> Json<DentListResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
@@ -572,7 +562,7 @@ host_fn!(
             match entry {
                 DirEntry::Directory(dir_objref) => Some(
                     dir_objref
-                        .list(&state.fs)
+                        .list(&state.env.fs)
                         .iter()
                         .map(
                             |(name, direntry)| {
@@ -606,7 +596,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_ls_faceted(user_data: RuntimeState; dent_ls_faceted_json: Json<DentLsFaceted>) -> Json<DentLsFacetedResult> {
+    dent_ls_faceted(user_data: SyscallProcessor; dent_ls_faceted_json: Json<DentLsFaceted>) -> Json<DentLsFacetedResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
@@ -619,7 +609,7 @@ host_fn!(
             match entry {
                 DirEntry::FacetedDirectory(fdir_objref) => Some(
                     fdir_objref
-                        .list(&state.fs, &clearance)
+                        .list(&state.env.fs, &clearance)
                         .iter()
                         .map(|(label, _)| label.clone().into())
                         .collect()
@@ -640,14 +630,14 @@ host_fn!(
 );
 
 host_fn!(
-    dent_ls_gate(user_data: RuntimeState; gate_fd: u64) -> Json<DentLsGateResult> {
+    dent_ls_gate(user_data: SyscallProcessor; gate_fd: u64) -> Json<DentLsGateResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
 
         let result = state.dents.get(&gate_fd).map(Clone::clone).and_then(|entry| {
             match entry {
                 DirEntry::Gate(gate_objref) => Some(
-                    match gate_objref.get(&state.fs).unwrap().unlabel() {
+                    match gate_objref.get(&state.env.fs).unwrap().unlabel() {
                         // Case #1: List a Direct Gate
                         Gate::Direct(dg_core) => {
                             // open the gate's app image and get its fd
@@ -656,7 +646,7 @@ host_fn!(
                                 state.max_blob_id += 1;
                                 
                                 let Some(blob) = state
-                                    .blobstore
+                                    .env.blobstore
                                     .open(dg_core.function.app_image.clone())
                                     .ok()
                                 else {
@@ -674,7 +664,7 @@ host_fn!(
                                 state.max_blob_id += 1;
 
                                 let Some(blob) = state
-                                    .blobstore
+                                    .env.blobstore
                                     .open(dg_core.function.runtime_image.clone())
                                     .ok()
                                 else {
@@ -736,7 +726,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_invoke(user_data: RuntimeState; dent_invoke_json: Json<DentInvoke>) -> Json<DentInvokeResult> {
+    dent_invoke(user_data: SyscallProcessor; dent_invoke_json: Json<DentInvoke>) -> Json<DentInvokeResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
@@ -749,7 +739,7 @@ host_fn!(
 );
 
 host_fn!(
-    dent_get_blob(user_data: RuntimeState; fd: u64) -> Json<BlobResult> {
+    dent_get_blob(user_data: SyscallProcessor; fd: u64) -> Json<BlobResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
 
@@ -757,8 +747,8 @@ host_fn!(
             Some(DirEntry::Blob(blob_objref)) => {
                 // get the blob from the blobstore using it's name in the fs
                 let blob = state
-                    .blobstore
-                    .open(blob_objref.read(&state.fs))
+                    .env.blobstore
+                    .open(blob_objref.read(&state.env.fs))
                 .expect("Get blob failed. Couldn't open blob");
                 
                 // insert the fetched blob in the table of open blobs
@@ -775,11 +765,11 @@ host_fn!(
 );
 
 host_fn!(
-    blob_create(user_data: RuntimeState;) -> Json<BlobResult> {
+    blob_create(user_data: SyscallProcessor;) -> Json<BlobResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
 
-        match state.blobstore.create() {
+        match state.env.blobstore.create() {
             Ok(newblob) => {
                 let blobfd = state.max_blob_id;
                 state.max_blob_id += 1;
@@ -793,7 +783,7 @@ host_fn!(
 );
 
 host_fn!(
-    blob_write(user_data: RuntimeState; blob_write_json: Json<BlobWrite>) -> Json<BlobResult> {
+    blob_write(user_data: SyscallProcessor; blob_write_json: Json<BlobWrite>) -> Json<BlobResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
 
@@ -811,7 +801,7 @@ host_fn!(
 );
 
 host_fn!(
-    blob_finalize(user_data: RuntimeState; blob_finalize_json: Json<BlobFinalize>) -> Json<BlobResult> {
+    blob_finalize(user_data: SyscallProcessor; blob_finalize_json: Json<BlobFinalize>) -> Json<BlobResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
 
@@ -820,7 +810,7 @@ host_fn!(
         if let Some(newblob) = state.create_blobs.remove(&fd) {
             let len = newblob.len() as u64;
             
-            match state.blobstore.save(newblob) {
+            match state.env.blobstore.save(newblob) {
                 Ok(finalized_blob) => {
                     state.blobs.insert(fd, finalized_blob);
                     Ok(Json(BlobResult { success: true, fd,  len, data: None}))
@@ -834,7 +824,7 @@ host_fn!(
 );
 
 host_fn!(
-    blob_read(user_data: RuntimeState; blob_read_json: Json<BlobRead>) -> Json<BlobResult> {
+    blob_read(user_data: SyscallProcessor; blob_read_json: Json<BlobRead>) -> Json<BlobResult> {
         let state = user_data.get()?;
         let state = state.lock().unwrap();
 
@@ -861,7 +851,7 @@ host_fn!(
 );
 
 host_fn!(
-    blob_close(user_data: RuntimeState; blob_close_json: Json<BlobClose>) -> Json<BlobResult> {
+    blob_close(user_data: SyscallProcessor; blob_close_json: Json<BlobClose>) -> Json<BlobResult> {
         let state = user_data.get()?;
         let mut state = state.lock().unwrap();
 
@@ -874,6 +864,87 @@ host_fn!(
         }
     }
 );
+
+
+pub struct SyscallGlobalEnv {
+    pub sched_conn: Option<TcpStream>,
+    pub fs: FS<Box<dyn BackingStore>>,
+    pub blobstore: Blobstore
+}
+
+
+pub struct SyscallProcessor {
+    env: SyscallGlobalEnv,
+    dents: HashMap<u64, DirEntry>,
+    max_dent_id: u64,
+    blobs: HashMap<u64, Blob>,
+    max_blob_id: u64,
+    create_blobs: HashMap<u64, NewBlob>,
+    http_client: reqwest::blocking::Client
+}
+
+impl SyscallProcessor {
+    pub fn new(env: SyscallGlobalEnv, label: Buckle, privilege: Component) -> Self {
+        {
+            // set up label & privilege
+            fs::utils::clear_label();
+            fs::utils::taint_with_label(label);
+            fs::utils::set_my_privilge(privilege);
+        }
+
+        // init root direntry in dents table
+        let mut dents: HashMap<u64, fs::DirEntry> = Default::default();
+        dents.insert(0, DirEntry::Directory(fs::ROOT_REF));
+
+        Self {
+            env,
+            create_blobs: Default::default(),
+            blobs: Default::default(),
+            dents,
+            max_dent_id: 1,
+            max_blob_id: 1,
+            http_client: reqwest::blocking::Client::new(),
+        }
+    }
+
+    pub fn run(self, path_to_wasm: &String) {
+
+        let wasm_obj = Wasm::file(path_to_wasm);
+        let manifest = Manifest::new([wasm_obj]);
+
+        let runtime_state = UserData::new(self);
+
+        let mut plugin = PluginBuilder::new(manifest)
+            .with_function("get_current_label", [], [PTR], runtime_state.clone(), get_current_label)
+            .with_function("buckle_parse", [PTR], [PTR], runtime_state.clone(), buckle_parse)
+            .with_function("taint_with_label", [PTR], [PTR], runtime_state.clone(), taint_with_label)
+            .with_function("declassify", [PTR], [PTR], runtime_state.clone(), declassify)
+            .with_function("root", [], [PTR], runtime_state.clone(), root)
+            .with_function("dent_open", [PTR], [PTR], runtime_state.clone(), dent_open)
+            .with_function("dent_close", [ValType::I64], [PTR], runtime_state.clone(), dent_close)
+            .with_function("dent_create", [PTR], [PTR], runtime_state.clone(), dent_create)
+            .with_function("dent_update", [PTR], [PTR], runtime_state.clone(), dent_update)
+            .with_function("dent_read", [ValType::I64], [PTR], runtime_state.clone(), dent_read)
+            .with_function("dent_link", [PTR], [PTR], runtime_state.clone(), dent_link)
+            .with_function("dent_unlink", [PTR], [PTR], runtime_state.clone(), dent_unlink)
+            .with_function("dent_list", [ValType::I64], [PTR], runtime_state.clone(), dent_list)
+            .with_function("dent_ls_faceted", [PTR], [PTR], runtime_state.clone(), dent_ls_faceted)
+            .with_function("dent_ls_gate", [ValType::I64], [PTR], runtime_state.clone(), dent_ls_gate)
+            .with_function("dent_invoke", [PTR], [PTR], runtime_state.clone(), dent_invoke)
+            .with_function("dent_get_blob", [ValType::I64], [PTR], runtime_state.clone(), dent_get_blob)
+            .with_function("blob_create", [], [PTR], runtime_state.clone(), blob_create)
+            .with_function("blob_write", [PTR], [PTR], runtime_state.clone(), blob_write)
+            .with_function("blob_finalize", [PTR], [PTR], runtime_state.clone(), blob_finalize)
+            .with_function("blob_read", [PTR], [PTR], runtime_state.clone(), blob_read)
+            .with_function("blob_close", [PTR], [PTR], runtime_state.clone(), blob_close)
+            .build()
+        .unwrap();
+
+        let res = plugin.call::<(), &str>("run", ()).unwrap();
+        println!("Return: {}", res);
+    }
+}
+
 
 fn main() -> Result<(), & 'static str> {
     // set RUST_LOG environment variable to configure log level
@@ -890,67 +961,26 @@ fn main() -> Result<(), & 'static str> {
     // set up FS object, label, and privilege
     let dbenv = std::boxed::Box::leak(Box::new(lmdb::get_dbenv(BACKING_STORE_PATH)));
     let fs: FS<Box<dyn BackingStore>> = FS::new(Box::new(&*dbenv));
-    
-    /* PRIVILEGE SET TO FALSE FOR TESTING PURPOSES (OVERRIDES LABEL CHECKS). EVENTUALLY SET BACK TO TRUE! */
-    // set up label and privilege
-    fs::utils::clear_label();
-    fs::utils::set_my_privilge(Component::dc_false());
-
-    // init root direntry
-    let mut dents: HashMap<u64, DirEntry> = Default::default();
-    dents.insert(0, DirEntry::Directory(ROOT_REF));
 
     // initialize fs
     if !fs.initialize() {
         println!("Existing root detected.");
     }
- 
-    let runtime_state = UserData::new(RuntimeState{
+
+    let env = SyscallGlobalEnv {
+        sched_conn: None,
         fs,
-        blobstore: Blobstore::new(BLOBSTORE_BASE_DIR_PATH.into(), BLOBSTORE_TMP_PATH.into()),
-        dents,
-        max_dent_id: 1,
-        blobs: Default::default(),
-        max_blob_id: 1,
-        create_blobs: Default::default()
-    });
+        blobstore: Blobstore::new(BLOBSTORE_BASE_DIR_PATH.into(), BLOBSTORE_TMP_PATH.into())
+    };
 
     // set up directories for blobstore
     let _ = std::fs::create_dir(BLOBSTORE_BASE_DIR_PATH);
     let _ = std::fs::create_dir(BLOBSTORE_TMP_PATH);
+ 
 
-
-    let wasm_obj = Wasm::file(file_path);
-    let manifest = Manifest::new([wasm_obj]);
-
-    let mut plugin = PluginBuilder::new(manifest)
-        .with_function("get_current_label", [], [PTR], runtime_state.clone(), get_current_label)
-        .with_function("buckle_parse", [PTR], [PTR], runtime_state.clone(), buckle_parse)
-        .with_function("taint_with_label", [PTR], [PTR], runtime_state.clone(), taint_with_label)
-        .with_function("declassify", [PTR], [PTR], runtime_state.clone(), declassify)
-        .with_function("root", [], [PTR], runtime_state.clone(), root)
-        .with_function("dent_open", [PTR], [PTR], runtime_state.clone(), dent_open)
-        .with_function("dent_close", [ValType::I64], [PTR], runtime_state.clone(), dent_close)
-        .with_function("dent_create", [PTR], [PTR], runtime_state.clone(), dent_create)
-        .with_function("dent_update", [PTR], [PTR], runtime_state.clone(), dent_update)
-        .with_function("dent_read", [ValType::I64], [PTR], runtime_state.clone(), dent_read)
-        .with_function("dent_link", [PTR], [PTR], runtime_state.clone(), dent_link)
-        .with_function("dent_unlink", [PTR], [PTR], runtime_state.clone(), dent_unlink)
-        .with_function("dent_list", [ValType::I64], [PTR], runtime_state.clone(), dent_list)
-        .with_function("dent_ls_faceted", [PTR], [PTR], runtime_state.clone(), dent_ls_faceted)
-        .with_function("dent_ls_gate", [ValType::I64], [PTR], runtime_state.clone(), dent_ls_gate)
-        .with_function("dent_invoke", [PTR], [PTR], runtime_state.clone(), dent_invoke)
-        .with_function("dent_get_blob", [ValType::I64], [PTR], runtime_state.clone(), dent_get_blob)
-        .with_function("blob_create", [], [PTR], runtime_state.clone(), blob_create)
-        .with_function("blob_write", [PTR], [PTR], runtime_state.clone(), blob_write)
-        .with_function("blob_finalize", [PTR], [PTR], runtime_state.clone(), blob_finalize)
-        .with_function("blob_read", [PTR], [PTR], runtime_state.clone(), blob_read)
-        .with_function("blob_close", [PTR], [PTR], runtime_state.clone(), blob_close)
-        .build()
-    .unwrap();
-
-    let res = plugin.call::<(), &str>("run", ()).unwrap();
-    println!("Return: {}", res);
+    /* PRIVILEGE SET TO FALSE FOR TESTING PURPOSES (OVERRIDES LABEL CHECKS). EVENTUALLY SET BACK TO TRUE! */
+    let processor = SyscallProcessor::new(env, Buckle::public(), Component::dc_false());
+    processor.run(&file_path);
 
     Ok(())
 }
