@@ -10,8 +10,9 @@ use faasten_interface_types::{dent_create, dent_open, dent_update, gate,
     DentOpen, DentOpenResult, DentResult, DentUnlink, DentUpdate, Service,
     DentInvoke, DentInvokeResult, BlobWrite, BlobResult, BlobFinalize, BlobRead, BlobClose};
 use faasten_core::fs::{self, lmdb, BackingStore, DirEntry, DirectGate, Gate, 
-    HttpVerb, RedirectGate, CURRENT_LABEL, FS};
+    HttpVerb, RedirectGate, CURRENT_LABEL, FS, PRIVILEGE};
 use faasten_core::blobstore::{Blob, Blobstore, NewBlob};
+use faasten_core::sched::message::{TaskReturn, ReturnCode};
 use labeled::{buckle::{Buckle, Component}, Label};
 
 const BACKING_STORE_PATH : &str = "./backing.fstn";
@@ -728,13 +729,125 @@ host_fn!(
 host_fn!(
     dent_invoke(user_data: SyscallProcessor; dent_invoke_json: Json<DentInvoke>) -> Json<DentInvokeResult> {
         let state = user_data.get()?;
-        let state = state.lock().unwrap();
+        let mut state = state.lock().unwrap();
 
-        let Json(DentInvoke { .. }) = dent_invoke_json;
+        use faasten_core::sched;
 
-        // SKIPPING UNTIL I UNDERSTAND IT BETTER
+        let Json(DentInvoke { fd, sync, payload, toblob, parameters }) = dent_invoke_json;
 
-        Ok(Json(DentInvokeResult{success: false, fd: None, data: vec![], headers: Default::default()}))
+        let (blobfd, data, headers) = state.dents.get(&fd)
+            .cloned()
+            .and_then(|entry| 
+                match entry {
+                    DirEntry::Gate(gate_objref) => {
+                        let gate = gate_objref.to_invokable(&state.env.fs);
+
+                        // invocation check. Current privilege must be at least as strong as gate's invoker clearance requirement
+                        if !fs::utils::get_privilege().implies(&gate.invoker_integrity_clearance) {
+                            return None;
+                        }
+
+                        sched::rpc::labeled_invoke(
+                            state.env.sched_conn.as_mut().unwrap(), 
+                            sched::message::LabeledInvoke {
+                                function: Some(gate.function.into()),
+                                label: Some(CURRENT_LABEL.with(|cl| cl.borrow().clone().into())),
+                                gate_privilege: Some(gate.privilege.into()),
+                                blobs: Default::default(),
+                                payload,
+                                headers: parameters,
+                                sync,
+                                invoker: Some(PRIVILEGE.with(|p| p.borrow().clone().into()))
+                            }
+                        ).ok()?;
+                        
+                        // whether to wait for result or not
+                        if !sync {
+                            Some((None::<u64>, Some(vec![]), None::<HashMap<String, Vec<u8>>>))
+                        } else {
+                            let res = sched::message::read::<TaskReturn>(state.env.sched_conn.as_mut().unwrap())
+                                .ok()?;
+                            
+                            let res_label: Buckle = res.label
+                                .clone()
+                                .map(|rpc_label| -> Buckle {rpc_label.into()})
+                            .unwrap_or(Buckle::public());
+                            
+                            fs::utils::taint_with_label(res_label);
+
+                            // whether to write function's result to a blob or not
+                            if !toblob {
+                                Some((None, res.payload.unwrap().body, None))
+                            } else {
+                                let mut newblob = state.env.blobstore.create().expect("Invoke failed. Couldn't create blob.");
+                                newblob.write_all(res.payload.unwrap().body()).expect("Invoke failed. Couldn't write to blob.");
+
+                                // finalize new blob
+                                let blob = state.env.blobstore.save(newblob).expect("Invoke failed. Couldn't save blob.");
+                                let blobfd = state.max_blob_id;
+                                state.max_blob_id += 1;
+                                state.blobs.insert(blobfd, blob);
+
+                                Some((Some(blobfd), None, None))
+                            }
+                        }
+                    }
+                    DirEntry::Service(service_objref) => {
+                        let service = service_objref.to_invokable(&state.env.fs);
+
+                        // invocation check. Current privilege must be at least as strong as gate's invoker clearance requirement
+                        if !fs::utils::get_privilege().implies(&service.invoker_integrity_clearance) {
+                            return None;
+                        }
+
+                        // declassify the current label before making http request
+                        fs::utils::declassify_with(&service.privilege);
+                        let send_res = state.http_send(&service, Some(payload), parameters);
+
+                        // re-taint the current label accordint to the service taint
+                        fs::utils::taint_with_label(service.taint);
+
+                        // process the response of the http request
+                        match send_res {
+                            Ok(mut response) => {
+                                // convert response headers from a HeaderMap to a Map of String to bytes
+                                let headers: HashMap<String, Vec<u8>> = response.headers().iter()
+                                    .map(|(a, b)| (a.to_string(), Vec::from(b.as_bytes())))
+                                .collect();
+
+                                // whether to write response to blob or not
+                                if !toblob {
+                                    Some((
+                                        None,
+                                        response.bytes().map(|bytes| bytes.to_vec()).ok(),
+                                        Some(headers)
+                                    ))
+                                } else {
+                                    let mut newblob = state.env.blobstore.create().expect("Create blob");
+                                    response.copy_to(&mut newblob).expect("Copy to blob.");
+
+                                    let blob = state.env.blobstore.save(newblob).expect("Save blob.");
+                                    let blobfd = state.max_blob_id;
+                                    state.max_blob_id += 1;
+                                    state.blobs.insert(blobfd, blob);
+
+                                    Some((Some(blobfd), None, Some(headers)))
+                                }
+                            },
+                            Err(_) => None
+                        }
+                    },
+                    _ => None
+                }
+            )
+        .unwrap_or((None, None, None));
+
+        Ok(Json(DentInvokeResult {
+            success: blobfd.is_some() || data.is_some(), 
+            fd: blobfd, 
+            data, 
+            headers: headers.unwrap_or(Default::default())
+        }))
     }
 );
 
@@ -866,6 +979,18 @@ host_fn!(
 );
 
 
+#[derive(Debug)]
+pub enum SyscallProcessorError {
+    UnreachableScheduler,
+    Blob(std::io::Error),
+    Database,
+    Http(reqwest::Error),
+    HttpAuth,
+    BadStrPath,
+    BadUrlArgs,
+}
+
+
 pub struct SyscallGlobalEnv {
     pub sched_conn: Option<TcpStream>,
     pub fs: FS<Box<dyn BackingStore>>,
@@ -907,7 +1032,33 @@ impl SyscallProcessor {
         }
     }
 
-    pub fn run(self, path_to_wasm: &String) {
+    fn http_send(
+        &self,
+        service: &fs::Service, 
+        body: Option<Vec<u8>>, 
+        parameters: HashMap<String, String>
+    ) -> Result<reqwest::blocking::Response, SyscallProcessorError> {
+        let url = strfmt::strfmt(&service.url, &parameters)
+            .map_err(|_| SyscallProcessorError::BadUrlArgs)?;
+        let method = service.verb.clone().into();
+        let headers = service.headers.iter()
+            .map(|(a, b)| {
+                (
+                    reqwest::header::HeaderName::from_bytes(a.as_bytes()).unwrap(),
+                    reqwest::header::HeaderValue::from_bytes(b.as_bytes()).unwrap()
+                )
+            })
+        .collect::<reqwest::header::HeaderMap>();
+
+        let mut request = self.http_client.request(method, url).headers(headers);
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+
+        request.send().map_err(|e| SyscallProcessorError::Http(e))
+    }
+
+    pub fn run(self, path_to_wasm: &String) -> Result<TaskReturn, SyscallProcessorError> {
 
         let wasm_obj = Wasm::file(path_to_wasm);
         let manifest = Manifest::new([wasm_obj]);
@@ -942,6 +1093,8 @@ impl SyscallProcessor {
 
         let res = plugin.call::<(), &str>("run", ()).unwrap();
         println!("Return: {}", res);
+
+        Ok(TaskReturn { code: ReturnCode::Success as i32, payload: None, label: None })
     }
 }
 
@@ -980,7 +1133,7 @@ fn main() -> Result<(), & 'static str> {
 
     /* PRIVILEGE SET TO FALSE FOR TESTING PURPOSES (OVERRIDES LABEL CHECKS). EVENTUALLY SET BACK TO TRUE! */
     let processor = SyscallProcessor::new(env, Buckle::public(), Component::dc_false());
-    processor.run(&file_path);
+    let _res = processor.run(&file_path);
 
     Ok(())
 }
