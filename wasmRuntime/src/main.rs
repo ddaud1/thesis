@@ -19,7 +19,9 @@ const BACKING_STORE_PATH : &str = "./backing.fstn";
 const BLOBSTORE_BASE_DIR_PATH: &str = "./blobs";
 const BLOBSTORE_TMP_PATH: &str = "./tmp";
 
-
+/*
+    Gets the function's current label
+ */
 host_fn!(
     get_current_label(user_data: SyscallProcessor;) -> Json<Buckle> {
         Ok(Json(CURRENT_LABEL
@@ -28,6 +30,9 @@ host_fn!(
     }
 );
 
+/*
+    Takes an input string and returns a corresponding label in Buckle format
+ */
 host_fn!(
     buckle_parse(user_data: SyscallProcessor; input_str: &str) -> Json<Option<Buckle>> {
         let label = Buckle::parse(input_str).ok();
@@ -35,6 +40,10 @@ host_fn!(
     }
 );
 
+/*
+    Takes an input label in Buckle format. Taints the function's current label
+    with the input label (new label = lub of the current and input labels)
+ */
 host_fn!(
     taint_with_label(user_data: SyscallProcessor; input_label_json: Json<Buckle>) -> Json<Buckle> {
         let Json(input_label) = input_label_json;
@@ -48,6 +57,13 @@ host_fn!(
     }
 );
 
+/*
+    Returns a declassified label given a target secrecy, first ensuring that the current
+    privilege allows declassification.
+    Returns the current label if privilege is not sufficient to declassify secrecy
+    
+    *** CURRENTLY DOESN'T ACTUALLY UPDATE CURRENT LABEL. SHOULD IT? RATIONALE BEHIND MAYBEBUCKLE? ****
+ */
 host_fn!(
     declassify(user_data: SyscallProcessor; target_secrecy_json: Json<Component>) -> Json<Buckle> {
         let Json(target_secrecy) = target_secrecy_json;
@@ -59,6 +75,9 @@ host_fn!(
     }
 );
 
+/*
+    Returns the root's file descriptor in the dents file descriptor table
+ */
 host_fn!(
     root(user_data: SyscallProcessor;) -> Json<DentResult> {
         Ok(Json(DentResult{
@@ -87,6 +106,23 @@ impl From<&DirEntry> for DentKindWrap {
     }
 }
 
+/*
+    Takes an entry and a file descriptor as input. There are 3 cases:
+        1. The file descriptor refers to a directory object. The entry
+            is a name. If an object in the directory matches the name, opens the
+            object by adding it to the dents file descriptor table
+        2. The file descriptor refers to a faceted directory object. The entry is a 
+            label. Searches for a matching label in the faceted directory, returning the
+            corresponding directory and opening it by adding it to the dents file
+            descriptor table.
+                If the label doesn't exist, creates a new directory for that label and
+                adds it to the faceted directory, before opening the new directory. This
+                is how faceted directories "initialize" new labels
+        3. Similar to #2, except the entry is a string which is parsed into a label
+    
+    Returns success if it works as expected along with the file descriptor of the newly opened
+    object, and the kind of object opened. Returns false otherwise
+ */
 host_fn!(
     dent_open(user_data: SyscallProcessor; dent_open_json: Json<DentOpen>) -> Json<DentOpenResult> {
         let state = user_data.get()?;
@@ -155,6 +191,10 @@ host_fn!(
     }
 );
 
+/*
+    Takes a file descriptor and tries to close the associated entry.
+    Returns true if a matching entry was found, false otherwise
+ */
 host_fn!(
     dent_close(user_data: SyscallProcessor; input_fd: u64) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -168,6 +208,22 @@ host_fn!(
     }
 );
 
+/*
+    Takes a label and the kind of object to create.
+        Directory, File: Creates an empty object and attaches the given label to the object
+        Faceted Directory: Creates an empty faceted directory. NOTE: The faceted directory object doesn't 
+            have an attached label
+        Blob: Gets the blobstore version of the Blob containing a file and name. Uses the 
+            name (i.e content-hash) from the blobstore as the dents Blob object, and attaches the given label
+        Gate: creates either a direct or redirect gate, and attaches the given label. Performs label checks
+            to ensure the provided label, declassify, and privilege are valid
+        Service: Creates a service gate and attaches the given label to the object. Performs label checks to
+            ensure that the provided label and privilege are valid
+    
+    If a valid entry is created, it is inserted into the dents table. Returns success and the corresponding 
+    file descriptor in dents. 
+    Returns false if create failed.
+ */
 host_fn!(
     dent_create(user_data: SyscallProcessor; dent_create_json: Json<DentCreate>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -309,6 +365,16 @@ host_fn!(
     }
 );
 
+/*
+    Updates an object given its file descriptor and the new info to add.
+        File: Overwrites previoues contents. Performs label check to ensure write is valid
+        Blob: Replaces the name/content-hash of old Blob with a new one fetched from the blobstore. Performs
+            a label check to ensure write is valid
+        Gate, Service: Replace fields of the gate. Performs label check to ensure the write and
+            any new privilege is valid
+    Returns true if update is successful and false otherwise. Note that the object at the given file descriptor
+    must match the type of data given to replace it.
+ */
 host_fn!(
     dent_update(user_data: SyscallProcessor; dent_update_json: Json<DentUpdate>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -486,6 +552,13 @@ host_fn!(
     }
 );
 
+/*
+    Reads a file object given its file descriptor. Performs an implicit label raise, doing a lub
+    of the current label and the file's label.
+
+    Returns true as well as the file's data and file descriptor if the read is successful. Returns
+    false otherwise.
+ */
 host_fn!(
     dent_read(user_data: SyscallProcessor; fd: u64) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -506,6 +579,15 @@ host_fn!(
     }
 );
 
+/*
+    Links an object into a directory, given the directory file descriptor, the name of
+    to give the lined object, and the target object's file descriptor. 
+    
+    Performs a label raise due to reading the directory (to check if name already exists),
+    and a label check to ensure the write (addinng a new name) is valid. 
+
+    Returns true if the link is successful and false otherwise.
+ */
 host_fn!(
     dent_link(user_data: SyscallProcessor; dent_link_json: Json<DentLink>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -532,6 +614,13 @@ host_fn!(
     }
 );
 
+/*
+    Unlinks an object from a directory, given the directory file descriptor and the name 
+    of the object. Does a label raise (due to reading the directory) and a label check
+    to ensure that the write is valid.
+
+    Returns true along with the directory file descriptor if the unlink is successful. Returns false otherwise.
+ */
 host_fn!(
     dent_unlink(user_data: SyscallProcessor; dent_unlink_json: Json<DentUnlink>) -> Json<DentResult> {
         let state = user_data.get()?;
@@ -554,6 +643,12 @@ host_fn!(
     }
 );
 
+/*
+    Lists the contents of a directory object given its file descriptor. Performs a label raise due t the read
+    of the directory.
+
+    Returns true along with the directory's content (name and type) if successful. Returns false otherwise.
+ */
 host_fn!(
     dent_list(user_data: SyscallProcessor; dir_fd: u64) -> Json<DentListResult> {
         let state = user_data.get()?;
@@ -596,6 +691,13 @@ host_fn!(
     }
 );
 
+/*
+    Lists the contents of a faceted directory object given its file descriptor and a clearance (defauls to public).
+    Performs a label raise with the given clearance. NOTE: the faceted directory object doesn't have a label.
+    
+    The list operation reveals only the contents whose label can flow to the given clearance. Returns true and the
+    contents of the faceted directory if the list is successful. Returns false otherwise.
+ */
 host_fn!(
     dent_ls_faceted(user_data: SyscallProcessor; dent_ls_faceted_json: Json<DentLsFaceted>) -> Json<DentLsFacetedResult> {
         let state = user_data.get()?;
@@ -630,6 +732,11 @@ host_fn!(
     }
 );
 
+/*
+    Lists a direct/redirect gate. Perform a label raise due to reading the gate object.
+
+    Returns true and the gate contents if succesful. Returns false otherwise.
+ */
 host_fn!(
     dent_ls_gate(user_data: SyscallProcessor; gate_fd: u64) -> Json<DentLsGateResult> {
         let state = user_data.get()?;
@@ -726,6 +833,20 @@ host_fn!(
     }
 );
 
+/*
+    Invokes a gate object. Takes the following inputs:
+        fd: the gate's file descriptor
+        sync: whether the gate is executed synchronously
+        payload: input passed to gate when invoked
+        toblob: whether to write the invoked function's result to a blob
+        parameters: ********************************************************** UNCLEAR
+
+    Performs an invocation check to ensure that the current privilege meets the gate's
+    invoker clearance requirement. For service gates, performs a declassify before sending
+    a http request. Taints the label immediately after according to the service object's taint field.
+
+    Returns ****************************** UNCLEAR e.g headers?
+ */
 host_fn!(
     dent_invoke(user_data: SyscallProcessor; dent_invoke_json: Json<DentInvoke>) -> Json<DentInvokeResult> {
         let state = user_data.get()?;
@@ -804,7 +925,7 @@ host_fn!(
                         fs::utils::declassify_with(&service.privilege);
                         let send_res = state.http_send(&service, Some(payload), parameters);
 
-                        // re-taint the current label accordint to the service taint
+                        // re-taint the current label according to the service taint
                         fs::utils::taint_with_label(service.taint);
 
                         // process the response of the http request
@@ -851,6 +972,14 @@ host_fn!(
     }
 );
 
+/*
+    Uses the content-hash of a blob to find it in the blobstore and 
+    place it in the blobs table.
+
+    The content hash is fetched from the filesystem storage. It involves 
+    reading a Blob object (a wrapper around the content hash), so a label
+    raise is performed.
+ */
 host_fn!(
     dent_get_blob(user_data: SyscallProcessor; fd: u64) -> Json<BlobResult> {
         let state = user_data.get()?;
@@ -877,6 +1006,12 @@ host_fn!(
     }
 );
 
+/*
+    Create a NewBlob object in the blobstore. This new Blob is 
+    in a temporary state until it is finalized by the blob_finalize cloud call.
+
+    Returns true and the new blob's file descriptor if successful. Returns false otherwise.
+ */
 host_fn!(
     blob_create(user_data: SyscallProcessor;) -> Json<BlobResult> {
         let state = user_data.get()?;
@@ -895,6 +1030,11 @@ host_fn!(
     }
 );
 
+/*
+    Writes to a NewBlob object. 
+
+    Returns true and the number of bytes written if successful. Returns false otherwise.
+ */
 host_fn!(
     blob_write(user_data: SyscallProcessor; blob_write_json: Json<BlobWrite>) -> Json<BlobResult> {
         let state = user_data.get()?;
@@ -913,6 +1053,13 @@ host_fn!(
     }
 );
 
+/*
+    Converts a NewBlob into a final, readonly Blob object containing a name (content hash) and the 
+    underlying file. The finalized blob is placed in the blobs table.
+
+    Returns true as well as the length and file descriptor of the blob if successful. 
+    Returns false otherwise.
+ */
 host_fn!(
     blob_finalize(user_data: SyscallProcessor; blob_finalize_json: Json<BlobFinalize>) -> Json<BlobResult> {
         let state = user_data.get()?;
@@ -936,6 +1083,12 @@ host_fn!(
     }
 );
 
+/*
+    Reads a blob given its file descriptor (in the blobs table), an offset (default = 0), and 
+    length (default = 4KB).
+
+    Returns true, the bytes read and their length if successful. Returns false otherwise.
+ */
 host_fn!(
     blob_read(user_data: SyscallProcessor; blob_read_json: Json<BlobRead>) -> Json<BlobResult> {
         let state = user_data.get()?;
@@ -963,6 +1116,11 @@ host_fn!(
     }
 );
 
+/*
+    Removes a blob from the blobs table.
+
+    Returns true if successful, false otherwise.
+ */
 host_fn!(
     blob_close(user_data: SyscallProcessor; blob_close_json: Json<BlobClose>) -> Json<BlobResult> {
         let state = user_data.get()?;
